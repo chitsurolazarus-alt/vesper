@@ -29,6 +29,27 @@
   function tick() { clockEl.textContent = new Date().toLocaleTimeString('en-GB', { hour12: false }); }
   tick(); setInterval(tick, 1000);
 
+  // ---------- unlock speech synthesis for iOS Safari ----------
+  // Safari (iOS in particular) requires speechSynthesis.speak() to be
+  // triggered directly within a user gesture at least once, or it silently
+  // does nothing (no error) — which is exactly what breaks it here, since
+  // replies are always spoken from inside an async callback after the
+  // network response, well after the tap/click that started it. Firing one
+  // near-silent utterance on the very first tap/click anywhere "unlocks"
+  // it for the rest of the session.
+  let speechUnlocked = false;
+  function unlockSpeechSynthesis() {
+    if (speechUnlocked || !('speechSynthesis' in window)) return;
+    speechUnlocked = true;
+    try {
+      const u = new SpeechSynthesisUtterance(' ');
+      u.volume = 0;
+      speechSynthesis.speak(u);
+    } catch (e) { /* ignore — worst case, first reply on iOS stays text-only */ }
+  }
+  document.addEventListener('click', unlockSpeechSynthesis, { once: true, capture: true });
+  document.addEventListener('touchend', unlockSpeechSynthesis, { once: true, capture: true });
+
   // ---------- gentle mouse/touch parallax tilt on the 3D core ----------
   scene.addEventListener('pointermove', (e) => {
     const r = scene.getBoundingClientRect();
