@@ -162,6 +162,34 @@
     if (muted && window.speechSynthesis) speechSynthesis.cancel();
   });
 
+  // Pick a real, human-quality male voice when one's available, instead of
+  // leaving it to whatever the browser's own default happens to be (which
+  // varies by device and isn't reliably male). Falls back gracefully:
+  // male+high-quality > any male > any high-quality > browser default.
+  // Voice list loads asynchronously in most browsers, hence voiceschanged.
+  let cachedVoices = [];
+  function refreshVoices() {
+    if ('speechSynthesis' in window) cachedVoices = speechSynthesis.getVoices();
+  }
+  if ('speechSynthesis' in window) {
+    refreshVoices();
+    speechSynthesis.onvoiceschanged = refreshVoices;
+  }
+  const QUALITY_PATTERNS = [/natural/i, /neural/i, /premium/i, /enhanced/i, /online/i];
+  const MALE_PATTERNS = [/\bguy\b/i, /\bdavid\b/i, /\bmark\b/i, /\bryan\b/i, /\bdaniel\b/i, /\balex\b/i, /\bfred\b/i, /\btom\b/i, /\baaron\b/i, /\bnathan\b/i, /\boliver\b/i, /\bjames\b/i, /\bbrian\b/i, /\beric\b/i, /\bmale\b/i];
+  function pickVoice() {
+    if (!cachedVoices.length) refreshVoices();
+    if (!cachedVoices.length) return null;
+    const enVoices = cachedVoices.filter(v => /^en(-|_|$)/i.test(v.lang));
+    const pool = enVoices.length ? enVoices : cachedVoices;
+    const isMale = (v) => MALE_PATTERNS.some((p) => p.test(v.name));
+    const isQuality = (v) => QUALITY_PATTERNS.some((p) => p.test(v.name));
+    return pool.find((v) => isMale(v) && isQuality(v))
+      || pool.find(isMale)
+      || pool.find(isQuality)
+      || pool[0] || null;
+  }
+
   // speakChunk queues one utterance without cancelling what's already
   // queued — used to speak a reply sentence-by-sentence as it streams in
   // (see streamSpeakReset/streamSpeakDelta below). speak() is the
@@ -172,7 +200,9 @@
     rememberSpoken(text);
     try {
       const u = new SpeechSynthesisUtterance(text);
-      u.rate = 1.03; u.pitch = 0.85;
+      const voice = pickVoice();
+      if (voice) u.voice = voice;
+      u.rate = 1.03; u.pitch = 1.0; // natural pitch — let a real human-recorded voice sound like itself instead of distorting it
       u.onstart = () => setState('speaking');
       u.onend = () => { if (!speechSynthesis.speaking) setState('idle'); };
       u.onerror = () => setState('idle');
