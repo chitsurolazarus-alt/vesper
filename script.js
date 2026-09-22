@@ -346,8 +346,15 @@
     micBtn.classList.toggle('hands-free-on', on);
     micBtn.title = on ? 'Hands-free is on — just talk. Click to turn it off.' : 'Click to start talking, hands-free (no more clicking after this).';
     if (on) {
-      recognition.continuous = true;
-      recognition.interimResults = true; // needed to catch speech starting, for barge-in, before it's finalized
+      // Chrome's continuous:true has a long-standing bug where it often
+      // never actually promotes a result to final — it just keeps
+      // restarting instead, so nothing ever reaches handleQuery. Single-
+      // utterance sessions (continuous:false) reliably finalize, same as
+      // the old click-to-talk mode always has; restarting one right after
+      // another (via onend below) gets the same "always listening" effect
+      // without relying on the broken continuous mode to do it natively.
+      recognition.continuous = false;
+      recognition.interimResults = true; // still want early interim results, for barge-in
       startRecognitionSafe();
     } else {
       recognition.continuous = false;
