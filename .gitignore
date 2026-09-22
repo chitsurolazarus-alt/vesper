@@ -1,4 +1,3 @@
-config.js
 agent/.env
 agent/agent_log.txt
 agent/__pycache__/

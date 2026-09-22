@@ -8,7 +8,7 @@ A voice-and-text AI assistant with a HUD/reactor-core interface — vanilla HTML
 - `style.css` — the 3D core, glass panels, animations, and the responsive/mobile layout
 - `script.js` — voice input/output, chat, reminders/timers/quick commands, hands-free mode, and the call to the local agent (System Control)
 - `config.example.js` — template for your Supabase project details
-- `config.js` — your actual values, **gitignored**, already filled in for your project
+- `config.js` — your actual values, already filled in for your project. Tracked in git (not gitignored) since it only holds a Supabase anon key, which is meant to be public — this is what lets GitHub Pages (or any static host) serve a working copy with no manual setup step
 - `supabase/functions/vesper-chat/index.ts` — the Edge Function source, proxies chat to Groq (also live in your Supabase project already — this copy is here so it's in version control with the rest of the app)
 - `manifest.json`, `sw.js`, `icons/` — the PWA bits (installable "Add to Home Screen" app, app-shell cache)
 - `agent/` — the local Python System Control agent (see its own section below)
@@ -53,6 +53,10 @@ Needs to be served over `http://localhost` (not opened as a `file://` path) for 
 3. Allow microphone access when your browser prompts.
 
 Or from a terminal in this folder: `npx serve .`
+
+## Deploying (GitHub Pages)
+
+Vesper is also live at **[chitsurolazarus-alt.github.io/vesper](https://chitsurolazarus-alt.github.io/vesper/)** via GitHub Pages, serving directly from this repo's `main` branch. This is a genuinely good way to test the mobile/PWA support on a real phone — Pages gives you real HTTPS, which voice input requires and a plain `http://<LAN-IP>` URL doesn't. `config.js` is tracked in git specifically so this works with no separate setup step; just push to `main` and Pages picks it up (usually within a minute or two). System Control still won't work from there — see "Mobile & installing as an app" below for why.
 
 ## Redeploying the Edge Function after changes
 
@@ -129,6 +133,6 @@ limitation of this app, it's a security boundary every browser enforces.
 ### Important things to know
 
 - **This is powerful.** The agent can see your whole screen and act on anything on it, including things outside this project. Only run it when you intend to use it, and treat the GEMINI_API_KEY in `agent/.env` like a password — it's gitignored, keep it that way.
-- **It's beta technology.** Gemini's computer-use tool (the vision-based screen control) is a newer capability and won't be perfectly reliable — it can misclick, misread small text, or need a couple of tries on fiddly UI. It's genuinely good at things like "open X and type Y" or "check if Y is running"; it's more error-prone on precise, fast, multi-step GUI work. This particular integration is also freshly written and hasn't been run end-to-end yet, so expect to do a bit of debugging the first time you use it — if something errors out, the traceback plus `agent/agent_log.txt` should point at what needs adjusting.
+- **It's beta technology.** Gemini's computer-use tool (the vision-based screen control) is a newer capability and won't be perfectly reliable — it can misclick, misread small text, or need a couple of tries on fiddly UI. It's genuinely good at things like "open X and type Y" or "check if Y is running"; it's more error-prone on precise, fast, multi-step GUI work. Verified working end-to-end (a plain "take a screenshot and describe what's focused" task ran successfully), but note the free tier caps computer-use specifically at **20 requests/day** — each step of a task uses one request, so a handful of multi-step tasks can exhaust it; the error message will say so plainly if you hit it.
 - **The model name and response handling in `vesper_agent.py` may need updating over time** — check [ai.google.dev/gemini-api/docs](https://ai.google.dev/gemini-api/docs) if it stops working after a while; Google occasionally changes model names and API shapes as the tool evolves.
 - Close the terminal running `vesper_agent.py` (or Ctrl+C) any time to shut the agent down completely — the web page keeps working for plain conversation either way, it just falls back to the Supabase path.
