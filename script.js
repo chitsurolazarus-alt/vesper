@@ -253,6 +253,15 @@
       recognition.continuous = false;
       recognition.interimResults = false;
       micReady = true;
+      // Chrome (and others) still segment "continuous" recognition into
+      // short bursts under the hood and stop on any brief pause or even a
+      // moment of silence right after starting — that's normal, not a
+      // failure. In hands-free mode we restart immediately and skip the
+      // idle flash entirely, so it reads as one unbroken "listening"
+      // state instead of visibly stopping and starting every second.
+      function scheduleHandsFreeRestart() {
+        setTimeout(() => { if (handsFree) startRecognitionSafe(); }, 0);
+      }
       recognition.onstart = () => {
         // Barge-in for click-to-talk: clicking the mic IS the interrupt
         // signal. In hands-free mode this fires on routine re-listen
@@ -263,12 +272,16 @@
       };
       recognition.onend = () => {
         listening = false; micBtn.classList.remove('active');
-        if (scene.classList.contains('listening')) setState('idle');
-        if (handsFree) setTimeout(() => { if (handsFree) startRecognitionSafe(); }, 300);
+        if (handsFree) {
+          scheduleHandsFreeRestart();
+        } else if (scene.classList.contains('listening')) {
+          setState('idle');
+        }
       };
       recognition.onerror = (e) => {
-        listening = false; micBtn.classList.remove('active'); setState('idle');
+        listening = false; micBtn.classList.remove('active');
         if (e.error === 'not-allowed' || e.error === 'service-not-allowed') {
+          setState('idle');
           micBtn.disabled = true;
           micNote.hidden = false;
           micNote.textContent = "Microphone access was blocked — check your browser's site permissions, or just type instead.";
@@ -276,8 +289,10 @@
           return;
         }
         if (handsFree && e.error !== 'aborted') {
-          setTimeout(() => { if (handsFree) startRecognitionSafe(); }, 300);
+          scheduleHandsFreeRestart(); // no-speech / network blips are routine in continuous mode
+          return;
         }
+        setState('idle');
       };
       recognition.onresult = (e) => {
         const res = e.results[e.results.length - 1];
