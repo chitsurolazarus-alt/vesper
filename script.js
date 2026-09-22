@@ -2,6 +2,7 @@
   "use strict";
 
   const clockEl = document.getElementById('clock');
+  const appEl = document.querySelector('.app');
   const scene = document.getElementById('scene');
   const tilt = document.getElementById('tilt');
   const stateLabel = document.getElementById('stateLabel');
@@ -14,10 +15,15 @@
   const muteBtn = document.getElementById('muteBtn');
   const micNote = document.getElementById('micNote');
   const agentToggle = document.getElementById('agentToggle');
+  const handsFreeToggle = document.getElementById('handsFreeToggle');
+  const clearBtn = document.getElementById('clearBtn');
   const confirmBar = document.getElementById('confirmBar');
   const confirmText = document.getElementById('confirmText');
   const confirmApprove = document.getElementById('confirmApprove');
   const confirmDeny = document.getElementById('confirmDeny');
+  const reminderBanner = document.getElementById('reminderBanner');
+  const reminderText = document.getElementById('reminderText');
+  const reminderDismiss = document.getElementById('reminderDismiss');
 
   // ---------- clock ----------
   function tick() { clockEl.textContent = new Date().toLocaleTimeString('en-GB', { hour12: false }); }
@@ -31,6 +37,33 @@
     tilt.style.transform = `rotateX(${-dy}deg) rotateY(${dx}deg)`;
   });
   scene.addEventListener('pointerleave', () => { tilt.style.transform = 'rotateX(0deg) rotateY(0deg)'; });
+
+  // ---------- mobile viewport: keep the layout correct as the phone's
+  // on-screen keyboard opens/closes, and as browser chrome shows/hides.
+  // CSS uses var(--app-height, 100dvh) for .app's height — this keeps that
+  // in sync on browsers where dvh alone doesn't track the keyboard well. ----------
+  function applyViewportHeight() {
+    const h = (window.visualViewport && window.visualViewport.height) || window.innerHeight;
+    document.documentElement.style.setProperty('--app-height', h + 'px');
+  }
+  applyViewportHeight();
+  if (window.visualViewport) window.visualViewport.addEventListener('resize', applyViewportHeight);
+  window.addEventListener('resize', applyViewportHeight);
+  window.addEventListener('orientationchange', applyViewportHeight);
+
+  // Folding away the decorative 3D core while the keyboard is up (narrow
+  // screens only, via CSS) keeps the transcript + input bar reachable
+  // instead of getting squeezed or pushed off-screen.
+  textInput.addEventListener('focus', () => appEl.classList.add('kb-open'));
+  textInput.addEventListener('blur', () => appEl.classList.remove('kb-open'));
+
+  // ---------- PWA install support (lightweight app-shell cache only —
+  // chat/agent calls all need live network and are left untouched) ----------
+  if ('serviceWorker' in navigator) {
+    window.addEventListener('load', () => {
+      navigator.serviceWorker.register('sw.js').catch(() => { /* fine without it */ });
+    });
+  }
 
   // ---------- state machine ----------
   const STATES = ['listening', 'thinking', 'speaking'];
@@ -63,7 +96,42 @@
   function updateMessage(bubble, text) { bubble.textContent = text; transcript.scrollTop = transcript.scrollHeight; }
   function markError(bubble) { bubble.closest('.msg').classList.add('error'); }
 
-  appendMessage('vesper', "Vesper online. Systems nominal — how can I help, Lazarus?");
+  // ---------- conversation memory: persist recent history across reloads ----------
+  const HISTORY_KEY = 'vesper.history';
+  const HISTORY_LIMIT = 40;
+
+  function loadHistory() {
+    try {
+      const parsed = JSON.parse(localStorage.getItem(HISTORY_KEY) || '[]');
+      return Array.isArray(parsed) ? parsed : [];
+    } catch (e) { return []; }
+  }
+  function saveHistory() {
+    try { localStorage.setItem(HISTORY_KEY, JSON.stringify(history.slice(-HISTORY_LIMIT))); } catch (e) { /* storage full/blocked — fine, just not persisted */ }
+  }
+  function pushHistory(role, content) {
+    history.push({ role, content });
+    saveHistory();
+  }
+
+  let history = loadHistory(); // {role:'user'|'assistant', content}
+
+  function clearConversation() {
+    history = [];
+    saveHistory();
+    transcript.innerHTML = '';
+    const greeting = "Conversation cleared. How can I help, Lazarus?";
+    appendMessage('vesper', greeting);
+    speak(greeting);
+  }
+  clearBtn.addEventListener('click', clearConversation);
+  const CLEAR_PHRASES = /^(clear|reset)\s+(the\s+|our\s+)?(conversation|chat|history)\b/i;
+
+  if (history.length) {
+    history.forEach(m => appendMessage(m.role === 'user' ? 'user' : 'vesper', m.content));
+  } else {
+    appendMessage('vesper', "Vesper online. Systems nominal — how can I help, Lazarus?");
+  }
 
   // ---------- voice output (speech synthesis) ----------
   let muted = false;
@@ -87,8 +155,16 @@
   }
 
   // ---------- voice input (speech recognition) ----------
+  const IS_IOS = /iPad|iPhone|iPod/.test(navigator.userAgent) && !window.MSStream;
   const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-  let recognition = null, micReady = false, listening = false;
+  let recognition = null, micReady = false, listening = false, handsFree = false;
+
+  function startRecognitionSafe() {
+    if (!recognition || listening) return;
+    try { recognition.start(); } catch (e) { /* already starting/started */ }
+  }
+
+  const WAKE_RE = /\b(?:hey\s+)?vesper\b[,.]?\s*(.*)$/i;
 
   if (SR) {
     try {
@@ -97,30 +173,82 @@
       recognition.continuous = false;
       recognition.interimResults = false;
       micReady = true;
-      recognition.onstart = () => { listening = true; setState('listening'); micBtn.classList.add('active'); };
-      recognition.onend = () => { listening = false; micBtn.classList.remove('active'); if (scene.classList.contains('listening')) setState('idle'); };
+      recognition.onstart = () => {
+        if (window.speechSynthesis) speechSynthesis.cancel(); // barge-in: starting to listen interrupts Vesper talking
+        listening = true; setState('listening'); micBtn.classList.add('active');
+      };
+      recognition.onend = () => {
+        listening = false; micBtn.classList.remove('active');
+        if (scene.classList.contains('listening')) setState('idle');
+        if (handsFree) setTimeout(() => { if (handsFree) startRecognitionSafe(); }, 300);
+      };
       recognition.onerror = (e) => {
         listening = false; micBtn.classList.remove('active'); setState('idle');
         if (e.error === 'not-allowed' || e.error === 'service-not-allowed') {
           micBtn.disabled = true;
           micNote.hidden = false;
           micNote.textContent = "Microphone access was blocked — check your browser's site permissions, or just type instead.";
+          if (handsFree) setHandsFree(false);
+          return;
+        }
+        if (handsFree && e.error !== 'aborted') {
+          setTimeout(() => { if (handsFree) startRecognitionSafe(); }, 300);
         }
       };
       recognition.onresult = (e) => {
-        const said = e.results[0][0].transcript;
-        handleQuery(said);
+        const res = e.results[e.results.length - 1];
+        const said = res[0].transcript;
+        // Barge-in: any detected speech (even interim, in hands-free mode)
+        // interrupts Vesper mid-sentence rather than waiting for her to finish.
+        if (said && said.trim() && window.speechSynthesis && speechSynthesis.speaking) {
+          speechSynthesis.cancel();
+        }
+        if (res.isFinal === false) return;
+        if (handsFree) {
+          const m = said.match(WAKE_RE);
+          if (!m) return; // ignore anything that doesn't start with the wake word
+          const command = m[1].trim();
+          if (command) handleQuery(command);
+        } else {
+          handleQuery(said);
+        }
       };
     } catch (e) { micReady = false; }
   }
   if (!micReady) {
     micBtn.disabled = true;
     micNote.hidden = false;
-    micNote.textContent = "Voice input isn't supported in this browser — try Chrome or Edge, or just type.";
+    micNote.textContent = IS_IOS
+      ? "Voice input isn't supported in this browser — try Chrome on Android, or just type."
+      : "Voice input isn't supported in this browser — try Chrome or Edge, or just type.";
+    handsFreeToggle.disabled = true;
+    handsFreeToggle.title = "Hands-free needs voice input support, which isn't available in this browser.";
   }
-  micBtn.addEventListener('click', () => {
-    if (!recognition || listening) return;
-    try { recognition.start(); } catch (e) { /* already started */ }
+  micBtn.addEventListener('click', () => { startRecognitionSafe(); });
+
+  // ---------- hands-free wake-word mode (opt-in, off by default) ----------
+  function setHandsFree(on) {
+    if (on && !micReady) return;
+    handsFree = on;
+    handsFreeToggle.classList.toggle('on', on);
+    handsFreeToggle.classList.toggle('cyan-on', on);
+    handsFreeToggle.textContent = on ? 'HANDS-FREE: ON' : 'HANDS-FREE: OFF';
+    if (on) {
+      recognition.continuous = true;
+      recognition.interimResults = true; // needed to catch speech starting, for barge-in, before it's finalized
+      startRecognitionSafe();
+    } else {
+      recognition.continuous = false;
+      recognition.interimResults = false;
+      try { recognition.stop(); } catch (e) { /* not running */ }
+    }
+  }
+  handsFreeToggle.addEventListener('click', () => {
+    if (!micReady) {
+      appendMessage('vesper', "Hands-free needs voice input support, which isn't available in this browser.");
+      return;
+    }
+    setHandsFree(!handsFree);
   });
 
   // ---------- Chat reasoning (via your Supabase Edge Function, powered by Groq) ----------
@@ -129,16 +257,14 @@
   // Edge Function in your Supabase project, which holds the key server-side
   // and forwards the request to Groq. See README.md to set it up.
   // (System Control / desktop actions are a separate path — see runAgentCommand
-  // above — and still go through Claude directly via the local agent.)
+  // above — and still go through Gemini directly via the local agent.)
 
   const PERSONA = "You are VESPER, a calm, sharp, faintly witty AI assistant with a sci-fi HUD-computer personality (think: a ship's AI, not a chatty chatbot). You are helping Lazarus, a software developer who runs a small digital agency in Cape Town, South Africa. Keep replies conversational and brief — 1 to 4 sentences unless the question genuinely needs more. Never use markdown, asterisks, or headers, since replies may be read aloud.";
 
-  let history = []; // {role:'user'|'assistant', content}
-
-  async function streamClaude(userText, onDelta) {
-    const messages = history.slice(-10).map(t => ({ role: t.role, content: t.content }));
-    messages.push({ role: 'user', content: userText });
-
+  // Low-level: POST to the Edge Function with an arbitrary system prompt +
+  // message list, consume the SSE stream, and return the full text. Shared
+  // by the main chat path (streamClaude) and the reminder-intent classifier.
+  async function groqComplete(system, messages, onDelta) {
     const resp = await fetch(`${CONFIG.SUPABASE_URL}/functions/v1/vesper-chat`, {
       method: 'POST',
       headers: {
@@ -146,10 +272,7 @@
         'apikey': CONFIG.SUPABASE_ANON_KEY,
         'content-type': 'application/json'
       },
-      body: JSON.stringify({
-        system: PERSONA,
-        messages
-      })
+      body: JSON.stringify({ system, messages })
     });
 
     if (!resp.ok) {
@@ -179,12 +302,18 @@
           const delta = evt.choices && evt.choices[0] && evt.choices[0].delta && evt.choices[0].delta.content;
           if (delta) {
             fullText += delta;
-            onDelta(fullText);
+            if (onDelta) onDelta(fullText);
           }
         } catch (e) { /* ignore partial/non-JSON lines */ }
       }
     }
     return fullText;
+  }
+
+  async function streamClaude(userText, onDelta) {
+    const messages = history.slice(-10).map(t => ({ role: t.role, content: t.content }));
+    messages.push({ role: 'user', content: userText });
+    return groqComplete(PERSONA, messages, onDelta);
   }
 
   // ---------- Vesper Agent (local system control) ----------
@@ -283,28 +412,206 @@
         const finalText = data.result || "Done.";
         updateMessage(bubble, finalText);
         if (data.status === 'error') markError(bubble);
-        history.push({ role: 'user', content: text });
-        history.push({ role: 'assistant', content: finalText });
+        pushHistory('user', text);
+        pushHistory('assistant', finalText);
         speak(finalText);
         return;
       }
     }
   }
 
+  // ---------- reminders: parsed by Groq (no fragile regex date parsing),
+  // fired client-side — only while this tab stays open ----------
+  const REMINDERS_KEY = 'vesper.reminders';
+  const REMINDER_TRIGGER = /\bremind(er|ers|ed|ing)?\b/i;
+  let reminders = [];
+
+  function loadReminders() {
+    try {
+      const parsed = JSON.parse(localStorage.getItem(REMINDERS_KEY) || '[]');
+      return Array.isArray(parsed) ? parsed : [];
+    } catch (e) { return []; }
+  }
+  function saveReminders() {
+    try { localStorage.setItem(REMINDERS_KEY, JSON.stringify(reminders)); } catch (e) { /* fine */ }
+  }
+
+  function showReminderBanner(text) {
+    reminderText.textContent = text;
+    reminderBanner.hidden = false;
+  }
+  reminderDismiss.addEventListener('click', () => { reminderBanner.hidden = true; });
+
+  function fireAlert(text) {
+    appendMessage('vesper', text);
+    showReminderBanner(text);
+    speak(text);
+    if ('Notification' in window && Notification.permission === 'granted') {
+      try { new Notification('Vesper', { body: text, icon: 'icons/icon-192.png' }); } catch (e) { /* fine */ }
+    }
+  }
+
+  function completeReminder(id) {
+    reminders = reminders.filter(x => x.id !== id);
+    saveReminders();
+  }
+
+  function scheduleReminder(r) {
+    const delay = r.fireAt - Date.now();
+    if (delay <= 0) {
+      fireAlert(`Reminder: ${r.message}`);
+      completeReminder(r.id);
+      return;
+    }
+    setTimeout(() => {
+      fireAlert(`Reminder: ${r.message}`);
+      completeReminder(r.id);
+    }, delay);
+  }
+
+  function addReminder(message, delaySeconds) {
+    const r = {
+      id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      message,
+      fireAt: Date.now() + delaySeconds * 1000,
+    };
+    reminders.push(r);
+    saveReminders();
+    scheduleReminder(r);
+    if ('Notification' in window && Notification.permission === 'default') {
+      Notification.requestPermission().catch(() => { /* fine, banner+speech still fire */ });
+    }
+    return r;
+  }
+
+  reminders = loadReminders();
+  reminders.forEach(scheduleReminder); // reschedules pending ones; fires any that were already due
+
+  async function tryParseReminder(text) {
+    if (!REMINDER_TRIGGER.test(text)) return null;
+    const sys = `You extract reminder requests from a single user message for a voice assistant.
+Respond with ONLY compact JSON, no prose, no markdown code fences, matching this schema exactly:
+{"is_reminder": boolean, "delay_seconds": number|null, "message": string|null}
+- Set is_reminder true only if the message is genuinely asking to be reminded of something later (e.g. "remind me to call the client in 20 minutes", "remind me at 3pm to send the invoice").
+- delay_seconds is the whole number of seconds from now until the reminder should fire. For a relative delay ("in 20 minutes") compute it directly. For a clock time ("at 3pm") assume today's date unless that time has already passed today, in which case use tomorrow.
+- message is a short imperative description of what to be reminded of (e.g. "call the client"), never including the word "remind" itself.
+- If this is not actually a reminder request, respond exactly {"is_reminder": false, "delay_seconds": null, "message": null}.
+The current local date/time is: ${new Date().toString()}`;
+    try {
+      const full = await groqComplete(sys, [{ role: 'user', content: text }], null);
+      const cleaned = full.trim().replace(/^```(?:json)?/i, '').replace(/```$/, '').trim();
+      const parsed = JSON.parse(cleaned);
+      if (parsed && parsed.is_reminder && typeof parsed.delay_seconds === 'number' && parsed.delay_seconds > 0 && parsed.message) {
+        return parsed;
+      }
+    } catch (e) { /* not parseable as a reminder — caller falls back to normal chat */ }
+    return null;
+  }
+
+  // ---------- quick built-in commands: instant, no network call ----------
+  function startTimer(totalSeconds, label) {
+    setTimeout(() => {
+      fireAlert(label ? `Timer done — ${label}.` : "Timer's up.");
+    }, totalSeconds * 1000);
+  }
+
+  const TIMER_RE = /\b(?:set (?:a )?)?(?:timer|countdown)(?: for)?\s+(\d+(?:\.\d+)?)\s*(hour|hr|minute|min|second|sec)s?\b/i;
+
+  const UNIT_TABLE = {
+    km_mi: v => v * 0.621371, mi_km: v => v / 0.621371,
+    kg_lb: v => v * 2.20462, lb_kg: v => v / 2.20462,
+    m_ft: v => v * 3.28084, ft_m: v => v / 3.28084,
+    c_f: v => v * 9 / 5 + 32, f_c: v => (v - 32) * 5 / 9,
+  };
+  const UNIT_ALIASES = {
+    km: 'km', kilometer: 'km', kilometers: 'km', kilometre: 'km', kilometres: 'km',
+    mi: 'mi', mile: 'mi', miles: 'mi',
+    kg: 'kg', kilogram: 'kg', kilograms: 'kg', kilo: 'kg', kilos: 'kg',
+    lb: 'lb', lbs: 'lb', pound: 'lb', pounds: 'lb',
+    m: 'm', meter: 'm', meters: 'm', metre: 'm', metres: 'm',
+    ft: 'ft', foot: 'ft', feet: 'ft',
+    c: 'c', celsius: 'c',
+    f: 'f', fahrenheit: 'f',
+  };
+  const UNIT_LABEL = { km: 'km', mi: 'mi', kg: 'kg', lb: 'lb', m: 'm', ft: 'ft', c: '°C', f: '°F' };
+  const CONVERT_RE = /(?:convert\s+)?(-?\d+(?:\.\d+)?)\s*([a-z°]+)\s+(?:to|in)\s+([a-z°]+)\b/i;
+
+  function tryUnitConversion(q) {
+    const m = q.match(CONVERT_RE);
+    if (!m) return null;
+    const value = parseFloat(m[1]);
+    const from = UNIT_ALIASES[m[2].toLowerCase()];
+    const to = UNIT_ALIASES[m[3].toLowerCase()];
+    if (!from || !to || from === to) return null;
+    const fn = UNIT_TABLE[`${from}_${to}`];
+    if (!fn) return null;
+    const result = Math.round(fn(value) * 100) / 100;
+    return `${value} ${UNIT_LABEL[from]} is about ${result} ${UNIT_LABEL[to]}.`;
+  }
+
+  const CALC_RE = /^(?:what(?:'s| is)\s+)?(-?[\d.]+(?:\s*(?:plus|minus|times|divided by|\+|-|\*|\/)\s*-?[\d.]+)+)\s*\??$/i;
+
+  function tryCalculator(q) {
+    const m = q.trim().match(CALC_RE);
+    if (!m) return null;
+    const expr = m[1]
+      .replace(/\btimes\b/gi, '*')
+      .replace(/\bdivided by\b/gi, '/')
+      .replace(/\bplus\b/gi, '+')
+      .replace(/\bminus\b/gi, '-');
+    if (!/^[-0-9+*/.\s]+$/.test(expr)) return null; // safety allowlist before evaluating
+    try {
+      const result = Function(`"use strict"; return (${expr});`)();
+      if (typeof result !== 'number' || !isFinite(result)) return null;
+      return `That's ${Math.round(result * 1000) / 1000}.`;
+    } catch (e) { return null; }
+  }
+
+  const CAPABILITIES_TEXT = "I can chat, answer questions, and read replies aloud. I can set reminders and timers, do quick math and unit conversions, and I remember our conversation across reloads — just say \"clear the conversation\" to reset it. Turn on hands-free mode and say \"Hey Vesper\" to talk to me without clicking the mic. And if you turn on System Control and start the local agent, I can open apps, run commands, and see and control your screen — asking first before anything risky.";
+
   function localQuickReply(text) {
     const q = text.trim().toLowerCase();
+
     if (/^(what('| i)?s the time|what time is it)\b/.test(q)) {
       return "It's " + new Date().toLocaleTimeString('en-GB', { hour12: false }) + ", South Africa Standard Time.";
     }
     if (/^(what('| i)?s the date|what day is it)\b/.test(q)) {
       return "Today is " + new Date().toLocaleDateString('en-GB', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' }) + ".";
     }
+    if (/what can you do|what are you capable of|^help\b/.test(q)) {
+      return CAPABILITIES_TEXT;
+    }
+
+    const timerMatch = q.match(TIMER_RE);
+    if (timerMatch) {
+      const amount = parseFloat(timerMatch[1]);
+      const unit = timerMatch[2];
+      const seconds = unit.startsWith('hour') || unit === 'hr' ? amount * 3600
+        : unit.startsWith('min') ? amount * 60
+        : amount;
+      const niceUnit = unit.startsWith('hour') || unit === 'hr' ? 'hour' : unit.startsWith('min') ? 'minute' : 'second';
+      startTimer(seconds, null);
+      return `Timer set for ${amount} ${niceUnit}${amount === 1 ? '' : 's'}.`;
+    }
+
+    const conv = tryUnitConversion(q);
+    if (conv) return conv;
+
+    const calc = tryCalculator(q);
+    if (calc) return calc;
+
     return null;
   }
 
   async function handleQuery(rawText) {
     const text = (rawText || '').trim();
     if (!text) return;
+
+    if (CLEAR_PHRASES.test(text)) {
+      clearConversation();
+      return;
+    }
+
     appendMessage('user', text);
 
     if (agentOn && agentReachable) {
@@ -313,22 +620,37 @@
 
     const quick = localQuickReply(text);
     if (quick) {
-      history.push({ role: 'user', content: text });
+      pushHistory('user', text);
       appendMessage('vesper', quick);
-      history.push({ role: 'assistant', content: quick });
+      pushHistory('assistant', quick);
       speak(quick);
       return;
     }
 
-    history.push({ role: 'user', content: text });
+    pushHistory('user', text);
     setState('thinking');
     const bubble = appendMessage('vesper', 'Thinking…');
 
     try {
+      if (REMINDER_TRIGGER.test(text)) {
+        const parsedReminder = await tryParseReminder(text);
+        if (parsedReminder) {
+          addReminder(parsedReminder.message, parsedReminder.delay_seconds);
+          const mins = Math.round(parsedReminder.delay_seconds / 60);
+          const when = mins >= 1 ? `in about ${mins} minute${mins === 1 ? '' : 's'}` : 'shortly';
+          const confirmMsg = `Got it — I'll remind you to ${parsedReminder.message} ${when}. Keep this tab open, since a reminder only fires while Vesper is running in the browser.`;
+          updateMessage(bubble, confirmMsg);
+          pushHistory('assistant', confirmMsg);
+          speak(confirmMsg);
+          setState('idle');
+          return;
+        }
+      }
+
       const finalText = await streamClaude(text, (partial) => updateMessage(bubble, partial));
       const cleanText = finalText || "I didn't catch a usable answer for that.";
       updateMessage(bubble, cleanText);
-      history.push({ role: 'assistant', content: cleanText });
+      pushHistory('assistant', cleanText);
       speak(cleanText);
     } catch (err) {
       console.error(err);

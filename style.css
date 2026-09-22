@@ -92,6 +92,7 @@ body{background:var(--bg); overflow-x:hidden;}
 .agent-toggle.on{ color:#03050a; background:linear-gradient(135deg,var(--amber),#ffcf94); border-color:var(--amber); }
 .agent-toggle.on.cyan-on{ background:linear-gradient(135deg,var(--cyan),#7be8ff); border-color:var(--cyan); }
 .agent-toggle.offline{ color:var(--text-faint); border-color:rgba(255,95,109,.35); }
+.agent-toggle:disabled{ opacity:.35; cursor:not-allowed; }
 
 .confirm-bar{
   margin:0 clamp(14px,5vw,64px);

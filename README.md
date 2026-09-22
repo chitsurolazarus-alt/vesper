@@ -5,11 +5,12 @@ A voice-and-text AI assistant with a HUD/reactor-core interface — vanilla HTML
 ## What's in here
 
 - `index.html` — page structure
-- `style.css` — the 3D core, glass panels, animations
-- `script.js` — voice input/output, the call to your Edge Function (chat), and the call to the local agent (System Control)
+- `style.css` — the 3D core, glass panels, animations, and the responsive/mobile layout
+- `script.js` — voice input/output, chat, reminders/timers/quick commands, hands-free mode, and the call to the local agent (System Control)
 - `config.example.js` — template for your Supabase project details
 - `config.js` — your actual values, **gitignored**, already filled in for your project
 - `supabase/functions/vesper-chat/index.ts` — the Edge Function source, proxies chat to Groq (also live in your Supabase project already — this copy is here so it's in version control with the rest of the app)
+- `manifest.json`, `sw.js`, `icons/` — the PWA bits (installable "Add to Home Screen" app, app-shell cache)
 - `agent/` — the local Python System Control agent (see its own section below)
 
 ## How it fits together
@@ -39,7 +40,7 @@ The Edge Function needs a Groq API key as a secret — this is the one step I ca
 
 That's it — no code changes needed. Once the secret is set, Vesper's replies will start working immediately (no redeploy required).
 
-Optional: you can also set a `GROQ_MODEL` secret to override the default (`llama-3.3-70b-versatile`) — check current model names at [console.groq.com/docs/models](https://console.groq.com/docs/models), since Groq's lineup changes over time.
+Optional: you can also set a `GROQ_MODEL` secret to override the default (`openai/gpt-oss-120b`) — check current model names at [console.groq.com/docs/models](https://console.groq.com/docs/models), since Groq's lineup changes over time (it already changed once: `llama-3.3-70b-versatile`, the original default, was retired by Groq).
 
 Note: System Control (the desktop agent) still needs its own separate `GEMINI_API_KEY` in `agent/.env` — see the System Control section below. Groq only covers plain chat.
 
@@ -65,8 +66,29 @@ supabase functions deploy vesper-chat --project-ref trwaupqgctnvcaertmod
 
 ## Browser support
 
-- Voice **output** (text-to-speech) works in all modern browsers.
-- Voice **input** (speech recognition) currently only works in Chrome, Edge, and other Chromium-based browsers — Firefox and Safari don't support the Web Speech API's recognition side. Vesper detects this and falls back to typing automatically.
+- Voice **output** (text-to-speech) works in all modern browsers, including iOS Safari.
+- Voice **input** (speech recognition) currently only works in Chrome, Edge, and other Chromium-based browsers — Firefox and Safari (including iOS Safari, even the installed PWA) don't support the Web Speech API's recognition side. Vesper detects this and falls back to typing automatically, with a message that's specific to iPhone ("try Chrome on Android, or just type") versus other unsupported browsers.
+
+## Mobile & installing as an app
+
+Vesper is a responsive PWA down to ~375px wide (iPhone SE and up), and can be "installed" to a phone's home screen:
+
+- **Android (Chrome)**: open the site, then menu → **Add to Home screen** (or use the install prompt Chrome shows automatically).
+- **iOS (Safari)**: open the site, tap **Share** → **Add to Home Screen**.
+
+Installed or not, the layout reflows for narrow screens, touch targets meet the 44px minimum on touch devices, and the on-screen keyboard opening won't cover the input bar (the 3D core hides itself while you're typing on a phone, to give the transcript and input room).
+
+**System Control cannot work from a phone.** The local agent (`agent/vesper_agent.py`) only listens on `127.0.0.1` — your PC's own loopback address, which nothing on another device (including your phone, even on the same Wi-Fi) can reach. This is a deliberate choice, not a bug: opening the agent up to the network means anything else on that network could potentially issue desktop-control commands to your PC. On a phone, Vesper works fully for plain chat, reminders, timers, and the other chat-path features — System Control just stays off, since the agent is unreachable. If you want LAN-reachable System Control from a phone despite the added exposure, ask and it can be added (binding to `0.0.0.0` plus a shared-secret header check) — it isn't set up that way today.
+
+## New JARVIS-style features
+
+All of these are free — no new paid API or service was added.
+
+- **Reminders**: say or type things like *"remind me to call the client in 20 minutes"* or *"remind me at 3pm to send the invoice."* Groq (the same model already used for chat) extracts the delay and message — no hand-rolled date parsing — and Vesper schedules it client-side. Reminders persist in `localStorage` across reloads, but **only fire while this browser tab is open**; there's no background service. When one fires, Vesper speaks it, shows an in-page banner, and (if you've granted permission) also fires a system Notification.
+- **Conversation memory**: recent chat history persists in `localStorage`, so refreshing the page doesn't lose the conversation. Say *"clear the conversation"* or click the **CLEAR** pill to reset it.
+- **Hands-free / wake-word mode**: click the **HANDS-FREE: OFF** pill to turn on continuous listening — off by default, and the pill turns cyan and says **ON** whenever it's actively listening, so it's never ambiguous whether the mic is live. While it's on, Vesper only acts on phrases that start with "Hey Vesper" or "Vesper," everything else is ignored.
+- **Quick commands (skip the LLM, instant)**: *"set a timer for 5 minutes"*, basic math (*"what's 24 times 7"*), unit conversions (*"10 km to miles"*, *"75 f to c"*), and *"what can you do"* for a capability summary — all handled locally in `script.js` with no network call.
+- **Voice barge-in**: start talking (or, in hands-free mode, just start speaking) and Vesper immediately stops talking, instead of waiting to finish its sentence.
 
 ## System Control — Vesper Agent (real desktop control)
 
