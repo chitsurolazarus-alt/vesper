@@ -262,7 +262,13 @@
       function scheduleHandsFreeRestart() {
         setTimeout(() => { if (handsFree) startRecognitionSafe(); }, 0);
       }
+      // Temporary diagnostic logging for the voice pipeline — filter the
+      // console on "[Vesper mic]" to see exactly what the recognizer is
+      // (or isn't) producing. Safe to leave in; it's just console.log.
+      const micLog = (...args) => console.log('[Vesper mic]', ...args);
+
       recognition.onstart = () => {
+        micLog('onstart', { handsFree });
         // Barge-in for click-to-talk: clicking the mic IS the interrupt
         // signal. In hands-free mode this fires on routine re-listen
         // cycles too, so that mode relies on onresult below instead —
@@ -271,6 +277,7 @@
         listening = true; setState('listening'); micBtn.classList.add('active');
       };
       recognition.onend = () => {
+        micLog('onend', { handsFree });
         listening = false; micBtn.classList.remove('active');
         if (handsFree) {
           scheduleHandsFreeRestart();
@@ -279,6 +286,7 @@
         }
       };
       recognition.onerror = (e) => {
+        micLog('onerror', e.error);
         listening = false; micBtn.classList.remove('active');
         if (e.error === 'not-allowed' || e.error === 'service-not-allowed') {
           setState('idle');
@@ -297,9 +305,11 @@
       recognition.onresult = (e) => {
         const res = e.results[e.results.length - 1];
         const said = (res[0].transcript || '').trim();
+        micLog('onresult', { said, isFinal: res.isFinal, confidence: res[0].confidence });
         if (!said) return;
 
         const isEcho = handsFree && looksLikeEcho(said);
+        if (isEcho) micLog('treated as echo, ignoring', said);
 
         // Barge-in: real (non-echo) speech interrupts Vesper mid-sentence.
         // Checked against the echo guard first, or Vesper's own voice
@@ -311,6 +321,7 @@
         if (res.isFinal === false) return;
         if (isEcho) return; // likely just heard herself, not a real command
 
+        micLog('dispatching to handleQuery', said);
         handleQuery(said);
       };
     } catch (e) { micReady = false; }

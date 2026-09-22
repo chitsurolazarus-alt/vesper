@@ -272,6 +272,16 @@ body{background:var(--bg); overflow-x:hidden;}
 .scene.speaking .bars span:nth-child(5){animation-delay:.48s;}
 @keyframes bar{ 0%,100%{height:8px;} 50%{height:24px;} }
 
+/* Speaking: a faster, punchier pulse on the sphere/shell (distinct from
+   the slow idle breathing) plus quicker flicker, so it's obvious at a
+   glance that she's talking, not just the small center bars. */
+.scene.speaking .core3d{ animation-duration:10s; }
+.scene.speaking .sphere{ animation:pulseTalk .6s ease-in-out infinite; }
+@keyframes pulseTalk{ 0%,100%{transform:translateZ(30px) scale(1);} 50%{transform:translateZ(30px) scale(1.12);} }
+.scene.speaking .shell{ animation:shellSpin 9s linear infinite, shellPulse 1.4s ease-in-out infinite; }
+@keyframes shellPulse{ 0%,100%{box-shadow:0 0 30px rgba(61,220,255,.25), inset 0 0 24px rgba(61,220,255,.15);} 50%{box-shadow:0 0 46px var(--cyan-glow), inset 0 0 30px rgba(61,220,255,.28);} }
+.scene.speaking .flicker{ animation-duration:.8s; }
+
 /* Continuous motion is decorative here — cut it for anyone who's asked
    their OS/browser to reduce motion, rather than adding a new mechanism. */
 @media (prefers-reduced-motion: reduce){
