@@ -162,31 +162,6 @@
     if (muted && window.speechSynthesis) speechSynthesis.cancel();
   });
 
-  // Prefer higher-quality system voices (e.g. Edge/Windows "Online (Natural)"
-  // voices, Chrome's neural Google voices) over the default legacy ones,
-  // which is most of what made replies sound flatly robotic. The voice list
-  // loads asynchronously in most browsers, hence the voiceschanged listener.
-  let cachedVoices = [];
-  function refreshVoices() {
-    if ('speechSynthesis' in window) cachedVoices = speechSynthesis.getVoices();
-  }
-  if ('speechSynthesis' in window) {
-    refreshVoices();
-    speechSynthesis.onvoiceschanged = refreshVoices;
-  }
-  const VOICE_PREFERENCE = [/natural/i, /neural/i, /premium/i, /enhanced/i, /online/i, /google us english/i];
-  function pickVoice() {
-    if (!cachedVoices.length) refreshVoices();
-    if (!cachedVoices.length) return null;
-    const enVoices = cachedVoices.filter(v => /^en(-|_|$)/i.test(v.lang));
-    const pool = enVoices.length ? enVoices : cachedVoices;
-    for (const pattern of VOICE_PREFERENCE) {
-      const match = pool.find(v => pattern.test(v.name));
-      if (match) return match;
-    }
-    return pool[0] || null;
-  }
-
   // speakChunk queues one utterance without cancelling what's already
   // queued — used to speak a reply sentence-by-sentence as it streams in
   // (see streamSpeakReset/streamSpeakDelta below). speak() is the
@@ -197,9 +172,7 @@
     rememberSpoken(text);
     try {
       const u = new SpeechSynthesisUtterance(text);
-      const voice = pickVoice();
-      if (voice) u.voice = voice;
-      u.rate = 1.1; u.pitch = 1.0; // natural pitch — algorithmic pitch-shifting was making default voices sound worse
+      u.rate = 1.03; u.pitch = 0.85;
       u.onstart = () => setState('speaking');
       u.onend = () => { if (!speechSynthesis.speaking) setState('idle'); };
       u.onerror = () => setState('idle');
