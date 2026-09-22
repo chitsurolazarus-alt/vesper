@@ -354,6 +354,7 @@ body{background:var(--bg); overflow-x:hidden;}
 .icon-btn:hover{ transform:translateY(-2px); border-color:var(--cyan-dim); color:var(--cyan); }
 .icon-btn:active{ transform:scale(.92); }
 .icon-btn.active{ color:#03050a; background:linear-gradient(135deg,var(--cyan),var(--amber)); box-shadow:0 0 20px var(--cyan-glow); }
+.icon-btn.hands-free-on{ color:#03050a; background:linear-gradient(135deg,var(--cyan),#7be8ff); box-shadow:0 0 16px var(--cyan-glow); }
 .icon-btn.muted{ color:#ff5f6d; border-color:rgba(255,95,109,.4); }
 .icon-btn svg{ width:18px; height:18px; }
 .icon-btn:disabled{ opacity:.35; cursor:not-allowed; }

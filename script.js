@@ -309,7 +309,10 @@
     handsFreeToggle.disabled = true;
     handsFreeToggle.title = "Hands-free needs voice input support, which isn't available in this browser.";
   }
-  micBtn.addEventListener('click', () => { startRecognitionSafe(); });
+  // The mic button itself now toggles continuous hands-free listening —
+  // one click and it's a running conversation, not a click-per-utterance
+  // control. setHandsFree is defined just below (hoisted, safe to call here).
+  micBtn.addEventListener('click', () => { setHandsFree(!handsFree); });
 
   // ---------- hands-free continuous conversation (opt-in, off by default):
   // once on, no wake word and no clicking — anything you say is treated as
@@ -321,6 +324,12 @@
     handsFreeToggle.classList.toggle('on', on);
     handsFreeToggle.classList.toggle('cyan-on', on);
     handsFreeToggle.textContent = on ? 'HANDS-FREE: ON' : 'HANDS-FREE: OFF';
+    // Persistent indicator, independent of the per-utterance .active class
+    // (which onstart/onend toggle during actual speech capture) — without
+    // this the mic button would flicker off between utterances instead of
+    // staying visibly lit for the whole time hands-free is on.
+    micBtn.classList.toggle('hands-free-on', on);
+    micBtn.title = on ? 'Hands-free is on — just talk. Click to turn it off.' : 'Click to start talking, hands-free (no more clicking after this).';
     if (on) {
       recognition.continuous = true;
       recognition.interimResults = true; // needed to catch speech starting, for barge-in, before it's finalized
