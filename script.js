@@ -173,6 +173,7 @@
   // errors, the agent) — it clears the queue first, same as before.
   function speakChunk(text) {
     if (muted || !('speechSynthesis' in window) || !text || !text.trim()) return;
+    rememberSpoken(text);
     try {
       const u = new SpeechSynthesisUtterance(text);
       const voice = pickVoice();
@@ -229,7 +230,21 @@
     try { recognition.start(); } catch (e) { /* already starting/started */ }
   }
 
-  const WAKE_RE = /\b(?:hey\s+)?vesper\b[,.]?\s*(.*)$/i;
+  // Self-echo guard: in hands-free mode the mic keeps listening while
+  // Vesper is talking (that's what makes barge-in possible), which on a
+  // laptop without headphones means it can pick up her own voice out of
+  // the speakers. Anything the recognizer hears that closely matches what
+  // she just said gets treated as an echo, not a real command.
+  let recentSpoken = [];
+  function rememberSpoken(text) {
+    recentSpoken.push(text.trim().toLowerCase());
+    if (recentSpoken.length > 6) recentSpoken.shift();
+  }
+  function looksLikeEcho(said) {
+    const s = said.trim().toLowerCase();
+    if (s.length < 3) return false;
+    return recentSpoken.some(chunk => chunk && (chunk.includes(s) || s.includes(chunk)));
+  }
 
   if (SR) {
     try {
@@ -239,7 +254,11 @@
       recognition.interimResults = false;
       micReady = true;
       recognition.onstart = () => {
-        if (window.speechSynthesis) speechSynthesis.cancel(); // barge-in: starting to listen interrupts Vesper talking
+        // Barge-in for click-to-talk: clicking the mic IS the interrupt
+        // signal. In hands-free mode this fires on routine re-listen
+        // cycles too, so that mode relies on onresult below instead —
+        // otherwise Vesper's replies would get cut off for no reason.
+        if (!handsFree && window.speechSynthesis) speechSynthesis.cancel();
         listening = true; setState('listening'); micBtn.classList.add('active');
       };
       recognition.onend = () => {
@@ -262,21 +281,22 @@
       };
       recognition.onresult = (e) => {
         const res = e.results[e.results.length - 1];
-        const said = res[0].transcript;
-        // Barge-in: any detected speech (even interim, in hands-free mode)
-        // interrupts Vesper mid-sentence rather than waiting for her to finish.
-        if (said && said.trim() && window.speechSynthesis && speechSynthesis.speaking) {
+        const said = (res[0].transcript || '').trim();
+        if (!said) return;
+
+        const isEcho = handsFree && looksLikeEcho(said);
+
+        // Barge-in: real (non-echo) speech interrupts Vesper mid-sentence.
+        // Checked against the echo guard first, or Vesper's own voice
+        // picked up by the mic would cancel her every time she started talking.
+        if (!isEcho && window.speechSynthesis && speechSynthesis.speaking) {
           speechSynthesis.cancel();
         }
+
         if (res.isFinal === false) return;
-        if (handsFree) {
-          const m = said.match(WAKE_RE);
-          if (!m) return; // ignore anything that doesn't start with the wake word
-          const command = m[1].trim();
-          if (command) handleQuery(command);
-        } else {
-          handleQuery(said);
-        }
+        if (isEcho) return; // likely just heard herself, not a real command
+
+        handleQuery(said);
       };
     } catch (e) { micReady = false; }
   }
@@ -291,7 +311,10 @@
   }
   micBtn.addEventListener('click', () => { startRecognitionSafe(); });
 
-  // ---------- hands-free wake-word mode (opt-in, off by default) ----------
+  // ---------- hands-free continuous conversation (opt-in, off by default):
+  // once on, no wake word and no clicking — anything you say is treated as
+  // a command directly, like talking to a person. Turn it off (or the
+  // System Control confirm bar) is still where you press something. ----------
   function setHandsFree(on) {
     if (on && !micReady) return;
     handsFree = on;
@@ -632,7 +655,7 @@ The current local date/time is: ${new Date().toString()}`;
     } catch (e) { return null; }
   }
 
-  const CAPABILITIES_TEXT = "I can chat, answer questions, and read replies aloud. I can set reminders and timers, do quick math and unit conversions, and I remember our conversation across reloads — just say \"clear the conversation\" to reset it. Turn on hands-free mode and say \"Hey Vesper\" to talk to me without clicking the mic. And if you turn on System Control and start the local agent, I can open apps, run commands, and see and control your screen — asking first before anything risky.";
+  const CAPABILITIES_TEXT = "I can chat, answer questions, and read replies aloud. I can set reminders and timers, do quick math and unit conversions, and I remember our conversation across reloads — just say \"clear the conversation\" to reset it. Turn on hands-free mode and just talk to me, no clicking or wake word needed. And if you turn on System Control and start the local agent, I can open apps, run commands, and see and control your screen — asking first before anything risky.";
 
   function localQuickReply(text) {
     const q = text.trim().toLowerCase();
