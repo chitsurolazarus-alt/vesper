@@ -141,17 +141,82 @@
     if (muted && window.speechSynthesis) speechSynthesis.cancel();
   });
 
-  function speak(text) {
-    if (muted || !('speechSynthesis' in window) || !text) { setState('idle'); return; }
+  // Prefer higher-quality system voices (e.g. Edge/Windows "Online (Natural)"
+  // voices, Chrome's neural Google voices) over the default legacy ones,
+  // which is most of what made replies sound flatly robotic. The voice list
+  // loads asynchronously in most browsers, hence the voiceschanged listener.
+  let cachedVoices = [];
+  function refreshVoices() {
+    if ('speechSynthesis' in window) cachedVoices = speechSynthesis.getVoices();
+  }
+  if ('speechSynthesis' in window) {
+    refreshVoices();
+    speechSynthesis.onvoiceschanged = refreshVoices;
+  }
+  const VOICE_PREFERENCE = [/natural/i, /neural/i, /premium/i, /enhanced/i, /online/i, /google us english/i];
+  function pickVoice() {
+    if (!cachedVoices.length) refreshVoices();
+    if (!cachedVoices.length) return null;
+    const enVoices = cachedVoices.filter(v => /^en(-|_|$)/i.test(v.lang));
+    const pool = enVoices.length ? enVoices : cachedVoices;
+    for (const pattern of VOICE_PREFERENCE) {
+      const match = pool.find(v => pattern.test(v.name));
+      if (match) return match;
+    }
+    return pool[0] || null;
+  }
+
+  // speakChunk queues one utterance without cancelling what's already
+  // queued — used to speak a reply sentence-by-sentence as it streams in
+  // (see streamSpeakReset/streamSpeakDelta below). speak() is the
+  // one-shot version used everywhere else (reminders, quick replies,
+  // errors, the agent) — it clears the queue first, same as before.
+  function speakChunk(text) {
+    if (muted || !('speechSynthesis' in window) || !text || !text.trim()) return;
     try {
-      speechSynthesis.cancel();
       const u = new SpeechSynthesisUtterance(text);
-      u.rate = 1.03; u.pitch = 0.85;
+      const voice = pickVoice();
+      if (voice) u.voice = voice;
+      u.rate = 1.1; u.pitch = 1.0; // natural pitch — algorithmic pitch-shifting was making default voices sound worse
       u.onstart = () => setState('speaking');
-      u.onend = () => setState('idle');
+      u.onend = () => { if (!speechSynthesis.speaking) setState('idle'); };
       u.onerror = () => setState('idle');
       speechSynthesis.speak(u);
-    } catch (e) { setState('idle'); }
+    } catch (e) { /* ignore — not fatal, text is already on screen */ }
+  }
+
+  function speak(text) {
+    if (muted || !('speechSynthesis' in window) || !text) { setState('idle'); return; }
+    speechSynthesis.cancel();
+    speakChunk(text);
+  }
+
+  // ---------- streaming speech: start talking mid-reply instead of
+  // waiting for the whole response, so it feels like a conversation
+  // instead of a request/response bot ----------
+  const SENTENCE_RE = /[^.!?]*[.!?]+(\s+|$)/g;
+  function streamSpeakReset() {
+    if (!muted && 'speechSynthesis' in window) speechSynthesis.cancel();
+    return 0; // spokenIndex
+  }
+  function streamSpeakDelta(fullText, spokenIndex) {
+    if (muted) return fullText.length; // nothing queued, so just track the pointer
+    const slice = fullText.slice(spokenIndex);
+    SENTENCE_RE.lastIndex = 0;
+    let m, consumed = 0;
+    while ((m = SENTENCE_RE.exec(slice)) !== null) {
+      const atEnd = SENTENCE_RE.lastIndex === slice.length;
+      if (atEnd && m[1] === '') break; // trailing punctuation with nothing after yet — could still be "3." growing into "3.14"
+      const sentence = m[0].trim();
+      if (sentence) speakChunk(sentence);
+      consumed = SENTENCE_RE.lastIndex;
+    }
+    return spokenIndex + consumed;
+  }
+  function streamSpeakFlush(fullText, spokenIndex) {
+    const remaining = fullText.slice(spokenIndex).trim();
+    if (remaining) speakChunk(remaining);
+    else if (muted || (!('speechSynthesis' in window)) || !speechSynthesis.speaking) setState('idle');
   }
 
   // ---------- voice input (speech recognition) ----------
@@ -647,11 +712,15 @@ The current local date/time is: ${new Date().toString()}`;
         }
       }
 
-      const finalText = await streamClaude(text, (partial) => updateMessage(bubble, partial));
+      let spokenIndex = streamSpeakReset();
+      const finalText = await streamClaude(text, (partial) => {
+        updateMessage(bubble, partial);
+        spokenIndex = streamSpeakDelta(partial, spokenIndex);
+      });
       const cleanText = finalText || "I didn't catch a usable answer for that.";
       updateMessage(bubble, cleanText);
       pushHistory('assistant', cleanText);
-      speak(cleanText);
+      streamSpeakFlush(cleanText, spokenIndex);
     } catch (err) {
       console.error(err);
       const hint = /GROQ_API_KEY secret is not set/i.test(String(err))
