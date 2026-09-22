@@ -5,7 +5,7 @@
 // other request (POST calls, cross-origin fetches to Supabase/Groq/the local
 // agent) untouched.
 
-const CACHE_NAME = "vesper-shell-v1";
+const CACHE_NAME = "vesper-shell-v2";
 const SHELL_FILES = [
   "./",
   "./index.html",
@@ -48,16 +48,18 @@ self.addEventListener("fetch", (event) => {
   if (url.origin !== self.location.origin) return;
   if (!SHELL_URLS.has(req.url) && !SHELL_URLS.has(url.href)) return;
 
+  // Network-first: this app is under active development, so a plain
+  // reload should always get the latest deployed code when there's a
+  // connection. The cache is purely an offline fallback, not a speed-up —
+  // cache-first here would mean every reload serves last visit's code,
+  // one deploy behind, until a second reload catches up. Not what we want.
   event.respondWith(
-    caches.match(req).then((cached) => {
-      const network = fetch(req).then((resp) => {
-        if (resp.ok) {
-          const copy = resp.clone();
-          caches.open(CACHE_NAME).then((cache) => cache.put(req, copy));
-        }
-        return resp;
-      }).catch(() => cached);
-      return cached || network;
-    })
+    fetch(req).then((resp) => {
+      if (resp.ok) {
+        const copy = resp.clone();
+        caches.open(CACHE_NAME).then((cache) => cache.put(req, copy));
+      }
+      return resp;
+    }).catch(() => caches.match(req))
   );
 });
