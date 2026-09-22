@@ -1,0 +1,7 @@
+config.js
+agent/.env
+agent/agent_log.txt
+agent/__pycache__/
+.DS_Store
+agent/venv/
+supabase/.temp/

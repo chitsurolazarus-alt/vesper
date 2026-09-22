@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content" />
+<title>Vesper</title>
+<link rel="manifest" href="manifest.json">
+<meta name="theme-color" content="#060a10">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Vesper">
+<link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+<link rel="icon" href="icons/icon-192.png">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Orbitron:wght@500;700;900&family=Rajdhani:wght@500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div class="app">
+  <header class="hud-top">
+    <div class="clock" id="clock">00:00:00</div>
+    <div class="wordmark">VESPER</div>
+    <div class="sysline">
+      <button type="button" id="handsFreeToggle" class="agent-toggle" title="Hands-free mode: say &quot;Hey Vesper&quot; before a command instead of clicking the mic. Mic stays on continuously while this is on.">HANDS-FREE: OFF</button>
+      <button type="button" id="agentToggle" class="agent-toggle" title="Toggle System Control (requires the local Vesper Agent running)">SYSTEM CONTROL: OFF</button>
+      <button type="button" id="clearBtn" class="agent-toggle" title="Clear the conversation">CLEAR</button>
+      <span class="dot" id="sysdot"></span><span id="statusLabel">NOMINAL</span>
+    </div>
+  </header>
+
+  <div class="scene" id="scene">
+    <div class="tilt" id="tilt">
+      <div class="core3d">
+        <div class="ring3d r1"><span class="node"></span></div>
+        <div class="ring3d r2"><span class="node"></span></div>
+        <div class="ring3d r3"></div>
+        <div class="sphere"></div>
+        <div class="bars"><span></span><span></span><span></span><span></span><span></span></div>
+      </div>
+    </div>
+    <div class="state-label" id="stateLabel">IDLE</div>
+  </div>
+
+  <section class="panel">
+    <div class="panel-label">TRANSCRIPT</div>
+    <div class="transcript" id="transcript"></div>
+  </section>
+  <div class="mic-note" id="micNote" hidden></div>
+  <div class="confirm-bar" id="confirmBar" hidden>
+    <span id="confirmText"></span>
+    <div class="confirm-actions">
+      <button type="button" id="confirmApprove" class="confirm-btn approve">Approve</button>
+      <button type="button" id="confirmDeny" class="confirm-btn deny">Deny</button>
+    </div>
+  </div>
+  <div class="confirm-bar reminder-bar" id="reminderBanner" hidden>
+    <span id="reminderText"></span>
+    <div class="confirm-actions">
+      <button type="button" id="reminderDismiss" class="confirm-btn approve">Got it</button>
+    </div>
+  </div>
+
+  <form class="inputbar" id="inputForm">
+    <button type="button" class="icon-btn" id="micBtn" title="Voice input" aria-label="Voice input">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v1a7 7 0 0 1-14 0v-1"/><line x1="12" y1="18" x2="12" y2="22"/><line x1="8" y1="22" x2="16" y2="22"/></svg>
+    </button>
+    <div class="field">
+      <input type="text" id="textInput" placeholder="Speak, or type a message…" autocomplete="off" />
+      <button type="submit" class="send-btn" id="sendBtn">Send</button>
+    </div>
+    <button type="button" class="icon-btn" id="muteBtn" title="Mute voice output" aria-label="Mute voice output">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polygon points="4 9 8 9 12 5 12 19 8 15 4 15 4 9"/><path d="M16 8a5 5 0 0 1 0 8"/><path d="M18.5 5.5a9 9 0 0 1 0 13"/></svg>
+    </button>
+  </form>
+
+  <div class="footnote">VESPER — press the mic or type below to begin</div>
+</div>
+
+<script src="config.js"></script>
+<script src="script.js"></script>
+</body>
+</html>
