@@ -24,6 +24,7 @@
     <div class="sysline">
       <button type="button" id="handsFreeToggle" class="agent-toggle" title="Hands-free mode: talk like a normal conversation, no clicking, no wake word needed. Mic stays on continuously while this is on.">HANDS-FREE: OFF</button>
       <button type="button" id="agentToggle" class="agent-toggle" title="Toggle System Control (requires the local Vesper Agent running)">SYSTEM CONTROL: OFF</button>
+      <button type="button" id="contactsToggle" class="agent-toggle" title="Manage saved contacts used by quick actions (call, text, email)">CONTACTS</button>
       <button type="button" id="clearBtn" class="agent-toggle" title="Clear the conversation">CLEAR</button>
       <span class="dot" id="sysdot"></span><span id="statusLabel">NOMINAL</span>
     </div>
@@ -68,6 +69,23 @@
     <span id="reminderText"></span>
     <div class="confirm-actions">
       <button type="button" id="reminderDismiss" class="confirm-btn approve">Got it</button>
+    </div>
+  </div>
+
+  <div class="settings-overlay" id="contactsPanel" hidden>
+    <div class="settings-card">
+      <div class="settings-head">
+        <span>SAVED CONTACTS</span>
+        <button type="button" id="contactsClose" class="icon-btn small" aria-label="Close">✕</button>
+      </div>
+      <p class="settings-hint">Used by quick actions like "call Mary" or "text the office" — a name plus a phone number and/or email you enter once. Stored only in this browser's local storage; never sent anywhere except inside the deep link an action triggers.</p>
+      <div class="contacts-list" id="contactsList"></div>
+      <form class="contacts-form" id="contactsForm">
+        <input type="text" id="contactName" placeholder="Name — e.g. Mary, the office" autocomplete="off" required />
+        <input type="tel" id="contactPhone" placeholder="Phone (optional)" autocomplete="off" />
+        <input type="email" id="contactEmail" placeholder="Email (optional)" autocomplete="off" />
+        <button type="submit" class="confirm-btn approve">Save</button>
+      </form>
     </div>
   </div>
 

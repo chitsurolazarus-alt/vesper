@@ -17,6 +17,14 @@
   const agentToggle = document.getElementById('agentToggle');
   const handsFreeToggle = document.getElementById('handsFreeToggle');
   const clearBtn = document.getElementById('clearBtn');
+  const contactsToggle = document.getElementById('contactsToggle');
+  const contactsPanel = document.getElementById('contactsPanel');
+  const contactsClose = document.getElementById('contactsClose');
+  const contactsList = document.getElementById('contactsList');
+  const contactsForm = document.getElementById('contactsForm');
+  const contactNameInput = document.getElementById('contactName');
+  const contactPhoneInput = document.getElementById('contactPhone');
+  const contactEmailInput = document.getElementById('contactEmail');
   const confirmBar = document.getElementById('confirmBar');
   const confirmText = document.getElementById('confirmText');
   const confirmApprove = document.getElementById('confirmApprove');
@@ -246,6 +254,10 @@
 
   // ---------- voice input (speech recognition) ----------
   const IS_IOS = /iPad|iPhone|iPod/.test(navigator.userAgent) && !window.MSStream;
+  // Quick Actions (tel:/sms:) only make sense where there's an actual phone
+  // app to hand off to — a desktop browser has no dialer/SMS app, so those
+  // two actions are gated on this rather than silently doing nothing.
+  const IS_MOBILE = IS_IOS || /Android/i.test(navigator.userAgent);
   const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
   let recognition = null, micReady = false, listening = false, handsFree = false;
 
@@ -721,7 +733,7 @@ The current local date/time is: ${new Date().toString()}`;
     } catch (e) { return null; }
   }
 
-  const CAPABILITIES_TEXT = "I can chat, answer questions, and read replies aloud. I can set reminders and timers, do quick math and unit conversions, and I remember our conversation across reloads — just say \"clear the conversation\" to reset it. Turn on hands-free mode and just talk to me, no clicking or wake word needed. And if you turn on System Control and start the local agent, I can open apps, run commands, and see and control your screen — asking first before anything risky.";
+  const CAPABILITIES_TEXT = "I can chat, answer questions, and read replies aloud. I can set reminders and timers, do quick math and unit conversions, and I remember our conversation across reloads — just say \"clear the conversation\" to reset it. I can also trigger real quick actions on this device — call or text a saved contact, email someone, open directions, open WhatsApp, Gmail, Maps or YouTube, or run a web search — say things like \"call Mary\" or \"navigate to the office\". Turn on hands-free mode and just talk to me, no clicking or wake word needed. And if you turn on System Control and start the local agent, I can open apps, run commands, and see and control your screen — asking first before anything risky.";
 
   function localQuickReply(text) {
     const q = text.trim().toLowerCase();
@@ -757,6 +769,232 @@ The current local date/time is: ${new Date().toString()}`;
     return null;
   }
 
+  // ---------- quick actions: trigger a real action on this device (call,
+  // text, email, directions, WhatsApp/Gmail/Maps/YouTube, web search) via
+  // standard web deep links (tel:, sms:, mailto:, maps/wa.me URLs). These
+  // work identically on iPhone and Android because they're plain URL
+  // schemes any web page is allowed to trigger — no native app or special
+  // permission needed.
+  //
+  // The real ceiling: this launches ONE specific app/action per request.
+  // It is NOT open-ended control of the phone's screen the way System
+  // Control drives the desktop — that would need a real native app
+  // (Android Accessibility Service; not possible on iOS at all due to
+  // Apple's sandboxing) and is out of scope here.
+  //
+  // Parsing follows the same shape as tryParseReminder() above: a cheap
+  // regex pre-check, then one Groq call for structured JSON, so plain
+  // conversation that happens to contain "call" or "search" doesn't pay
+  // for a wasted round-trip through the wrong path.
+  const CONTACTS_KEY = 'vesper.contacts';
+
+  function loadContacts() {
+    try {
+      const parsed = JSON.parse(localStorage.getItem(CONTACTS_KEY) || '[]');
+      return Array.isArray(parsed) ? parsed : [];
+    } catch (e) { return []; }
+  }
+  function saveContacts() {
+    try { localStorage.setItem(CONTACTS_KEY, JSON.stringify(contacts)); } catch (e) { /* fine */ }
+  }
+  let contacts = loadContacts();
+
+  function findContact(name) {
+    const n = (name || '').trim().toLowerCase();
+    if (!n) return null;
+    return contacts.find(c => c.name.toLowerCase() === n) || null;
+  }
+  function upsertContact(name, field, value) {
+    const n = name.trim();
+    let c = findContact(n);
+    if (!c) { c = { name: n }; contacts.push(c); }
+    c[field] = value;
+    saveContacts();
+    renderContactsList();
+    return c;
+  }
+
+  function renderContactsList() {
+    contactsList.innerHTML = '';
+    if (!contacts.length) {
+      const empty = document.createElement('div');
+      empty.className = 'contacts-empty';
+      empty.textContent = 'No contacts saved yet.';
+      contactsList.appendChild(empty);
+      return;
+    }
+    contacts.slice().sort((a, b) => a.name.localeCompare(b.name)).forEach((c) => {
+      const row = document.createElement('div');
+      row.className = 'contact-row';
+      const info = document.createElement('span');
+      info.textContent = c.name + (c.phone ? ' · ' + c.phone : '') + (c.email ? ' · ' + c.email : '');
+      const del = document.createElement('button');
+      del.type = 'button';
+      del.className = 'contact-del';
+      del.textContent = 'Remove';
+      del.addEventListener('click', () => {
+        contacts = contacts.filter((x) => x !== c);
+        saveContacts();
+        renderContactsList();
+      });
+      row.appendChild(info);
+      row.appendChild(del);
+      contactsList.appendChild(row);
+    });
+  }
+
+  contactsToggle.addEventListener('click', () => {
+    renderContactsList();
+    contactsPanel.hidden = false;
+  });
+  contactsClose.addEventListener('click', () => { contactsPanel.hidden = true; });
+  contactsPanel.addEventListener('click', (e) => { if (e.target === contactsPanel) contactsPanel.hidden = true; });
+  contactsForm.addEventListener('submit', (e) => {
+    e.preventDefault();
+    const name = contactNameInput.value.trim();
+    const phone = contactPhoneInput.value.trim();
+    const email = contactEmailInput.value.trim();
+    if (!name || (!phone && !email)) return;
+    if (phone) upsertContact(name, 'phone', sanitizePhone(phone));
+    if (email) upsertContact(name, 'email', email);
+    contactsForm.reset();
+  });
+
+  function sanitizePhone(raw) { return (raw || '').replace(/[^\d+]/g, ''); }
+  function contactLabel(p) { return p.contact_name || p.number || p.email || 'them'; }
+
+  // sameTab actions (tel:/sms:/mailto:) navigate the current page to a
+  // custom URL scheme, which browsers hand off to the relevant app without
+  // actually leaving Vesper. New-tab actions (maps/search/WhatsApp/Gmail
+  // web/YouTube) use window.open, which is more visible but can get
+  // caught by a pop-up blocker since it fires after an async Groq call
+  // rather than inside the original click/submit gesture — triggerDeepLink
+  // reports whether that happened so the caller can say so.
+  function triggerDeepLink(url, sameTab) {
+    if (sameTab) { window.location.href = url; return true; }
+    const win = window.open(url, '_blank', 'noopener');
+    return !!win;
+  }
+
+  function buildCallAction(p) {
+    if (!IS_MOBILE) return { ok: false, message: "Calling needs a phone — this is a desktop browser, so there's no dialer to hand it to." };
+    const num = sanitizePhone(p.number);
+    if (!num) return { ok: false, message: "I didn't catch a number to call." };
+    return { ok: true, url: `tel:${num}`, sameTab: true, confirm: `Calling ${contactLabel(p)}.` };
+  }
+  function buildTextAction(p) {
+    if (!IS_MOBILE) return { ok: false, message: "Texting needs a phone — this is a desktop browser, so there's no messaging app to hand it to." };
+    const num = sanitizePhone(p.number);
+    if (!num) return { ok: false, message: "I didn't catch a number to text." };
+    const body = p.message ? `?body=${encodeURIComponent(p.message)}` : '';
+    return { ok: true, url: `sms:${num}${body}`, sameTab: true, confirm: `Texting ${contactLabel(p)}${p.message ? `: "${p.message}"` : ''}.` };
+  }
+  function buildEmailAction(p) {
+    const addr = (p.email || '').trim();
+    if (!addr) return { ok: false, message: "I didn't catch an email address." };
+    const params = new URLSearchParams();
+    if (p.subject) params.set('subject', p.subject);
+    if (p.message) params.set('body', p.message);
+    const qs = params.toString();
+    return { ok: true, url: `mailto:${encodeURIComponent(addr)}${qs ? '?' + qs : ''}`, sameTab: true, confirm: `Opening an email to ${contactLabel(p)}.` };
+  }
+  function buildNavigateAction(p) {
+    if (!p.destination) return { ok: false, message: "I didn't catch a destination." };
+    return { ok: true, url: `https://www.google.com/maps/dir/?api=1&destination=${encodeURIComponent(p.destination)}`, sameTab: false, confirm: `Opening directions to ${p.destination}.` };
+  }
+  function buildWhatsappAction(p) {
+    const num = p.number ? sanitizePhone(p.number) : '';
+    const text = p.message ? `?text=${encodeURIComponent(p.message)}` : '';
+    return { ok: true, url: `https://wa.me/${num}${text}`, sameTab: false, confirm: num ? `Opening WhatsApp to ${contactLabel(p)}.` : 'Opening WhatsApp.' };
+  }
+  function buildSearchAction(p) {
+    if (!p.query) return { ok: false, message: "I didn't catch what to search for." };
+    return { ok: true, url: `https://www.google.com/search?q=${encodeURIComponent(p.query)}`, sameTab: false, confirm: `Searching for ${p.query}.` };
+  }
+  const APP_LABELS = { gmail: 'Gmail', maps: 'Google Maps', youtube: 'YouTube' };
+  function buildOpenAppAction(p) {
+    if (p.app === 'gmail') {
+      const params = new URLSearchParams({ view: 'cm', fs: '1' });
+      if (p.email) params.set('to', p.email);
+      if (p.subject) params.set('su', p.subject);
+      return { ok: true, url: `https://mail.google.com/mail/?${params.toString()}`, sameTab: false, confirm: 'Opening Gmail.' };
+    }
+    if (p.app === 'maps') {
+      const url = p.query ? `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(p.query)}` : 'https://www.google.com/maps';
+      return { ok: true, url, sameTab: false, confirm: p.query ? `Opening Maps for ${p.query}.` : 'Opening Maps.' };
+    }
+    if (p.app === 'youtube') {
+      const url = p.query ? `https://www.youtube.com/results?search_query=${encodeURIComponent(p.query)}` : 'https://www.youtube.com';
+      return { ok: true, url, sameTab: false, confirm: p.query ? `Opening YouTube, searching for ${p.query}.` : 'Opening YouTube.' };
+    }
+    return { ok: false, message: `I don't have a link set up for ${APP_LABELS[p.app] || 'that app'} yet.` };
+  }
+
+  const QUICK_ACTION_BUILDERS = {
+    call: buildCallAction,
+    text: buildTextAction,
+    email: buildEmailAction,
+    navigate: buildNavigateAction,
+    whatsapp: buildWhatsappAction,
+    search: buildSearchAction,
+    open_app: buildOpenAppAction,
+  };
+
+  // If a call/text/whatsapp/email names a contact but has no number/email
+  // directly, try the local contacts list; if that also comes up empty,
+  // return what's missing so the caller can ask for it once.
+  function resolveActionContact(parsed) {
+    if ((parsed.type === 'call' || parsed.type === 'text' || parsed.type === 'whatsapp') && !parsed.number && parsed.contact_name) {
+      const c = findContact(parsed.contact_name);
+      if (c && c.phone) { parsed.number = c.phone; return null; }
+      if (parsed.type === 'whatsapp') return null; // WhatsApp can open blank, no number required
+      return { name: parsed.contact_name, field: 'phone' };
+    }
+    if (parsed.type === 'email' && !parsed.email && parsed.contact_name) {
+      const c = findContact(parsed.contact_name);
+      if (c && c.email) { parsed.email = c.email; return null; }
+      return { name: parsed.contact_name, field: 'email' };
+    }
+    return null;
+  }
+
+  function executeQuickAction(parsed) {
+    const builder = QUICK_ACTION_BUILDERS[parsed.type];
+    if (!builder) return null;
+    const missing = resolveActionContact(parsed);
+    if (missing) return { pendingContact: { ...missing, action: parsed } };
+    return builder(parsed);
+  }
+
+  const QUICK_ACTION_TRIGGER = /\b(call|dial|phone|text|sms|message|email|mail|navigate to|directions? to|drive to|take me to|whatsapp|open (gmail|maps|youtube)|search for|look up|google)\b/i;
+
+  async function tryParseQuickAction(text) {
+    if (!QUICK_ACTION_TRIGGER.test(text)) return null;
+    const sys = `You extract "quick action" requests from a single user message for a voice assistant that can trigger real device actions via web deep links: placing a phone call, sending a text, sending an email, opening turn-by-turn directions, opening WhatsApp, opening Gmail/Google Maps/YouTube, or running a web search.
+Respond with ONLY compact JSON, no prose, no markdown code fences, matching this schema exactly:
+{"is_action": boolean, "type": "call"|"text"|"email"|"navigate"|"whatsapp"|"open_app"|"search"|null, "contact_name": string|null, "number": string|null, "email": string|null, "message": string|null, "subject": string|null, "destination": string|null, "app": "gmail"|"maps"|"youtube"|null, "query": string|null}
+- "call"/"text": set contact_name to a spoken name (e.g. "Mary", "the office") if a name was used, or number if a number was spoken/typed directly. "text" should also fill message with what to send, if given.
+- "email": fill contact_name or email, plus subject and/or message (used as the body) if given.
+- "navigate": fill destination with just the place/address, stripped of filler words like "directions to" or "take me to".
+- "whatsapp": only when WhatsApp is explicitly mentioned. Fill contact_name or number if given, plus message if given.
+- "open_app": only for "open Gmail" / "open Maps" / "open YouTube" style requests not already covered by call/text/email/navigate/whatsapp above. Set app accordingly, and query if a search inside that app was also specified (e.g. "open youtube and search for lo-fi beats" -> app "youtube", query "lo-fi beats").
+- "search": fill query with just the search terms, stripped of filler words like "search for" or "look up".
+- Set is_action false for anything else, including plain conversation, reminders, or a message that merely mentions one of these words without asking for the action. If false, every other field must be null.
+- Never invent a name, number, address, or query that wasn't in the message.`;
+    try {
+      const full = await groqComplete(sys, [{ role: 'user', content: text }], null);
+      const cleaned = full.trim().replace(/^```(?:json)?/i, '').replace(/```$/, '').trim();
+      const parsed = JSON.parse(cleaned);
+      if (parsed && parsed.is_action && parsed.type) return parsed;
+    } catch (e) { /* not parseable as a quick action — caller falls back to normal chat */ }
+    return null;
+  }
+
+  // Set when a quick action is missing a contact's number/email — the very
+  // next message is treated as the answer instead of going through normal
+  // routing, then the action fires and the contact is remembered.
+  let pendingContactRequest = null;
+
   async function handleQuery(rawText) {
     const text = (rawText || '').trim();
     if (!text) return;
@@ -767,6 +1005,42 @@ The current local date/time is: ${new Date().toString()}`;
     }
 
     appendMessage('user', text);
+
+    if (pendingContactRequest) {
+      const pending = pendingContactRequest;
+      pendingContactRequest = null;
+      pushHistory('user', text);
+      if (/^(never ?mind|cancel|skip|no thanks?)\b/i.test(text)) {
+        const msg = 'No problem, cancelled.';
+        appendMessage('vesper', msg);
+        pushHistory('assistant', msg);
+        speak(msg);
+        return;
+      }
+      const value = pending.field === 'email' ? text.trim() : sanitizePhone(text);
+      if (!value) {
+        const msg = "I still didn't catch that — let's skip it for now.";
+        appendMessage('vesper', msg);
+        pushHistory('assistant', msg);
+        speak(msg);
+        return;
+      }
+      upsertContact(pending.name, pending.field, value);
+      pending.action[pending.field === 'email' ? 'email' : 'number'] = value;
+      const result = QUICK_ACTION_BUILDERS[pending.action.type](pending.action);
+      let msg;
+      if (result.ok) {
+        const opened = triggerDeepLink(result.url, result.sameTab);
+        msg = `Got it, I'll remember ${pending.name}. ${result.confirm}`;
+        if (!result.sameTab && !opened) msg += " (Your browser's pop-up blocker may have stopped that — allow pop-ups for this site and try again.)";
+      } else {
+        msg = `Saved ${pending.name}, but ${result.message}`;
+      }
+      appendMessage('vesper', msg);
+      pushHistory('assistant', msg);
+      speak(msg);
+      return;
+    }
 
     if (agentOn && agentReachable) {
       return runAgentCommand(text);
@@ -798,6 +1072,37 @@ The current local date/time is: ${new Date().toString()}`;
           speak(confirmMsg);
           setState('idle');
           return;
+        }
+      }
+
+      if (QUICK_ACTION_TRIGGER.test(text)) {
+        const parsedAction = await tryParseQuickAction(text);
+        if (parsedAction) {
+          const result = executeQuickAction(parsedAction);
+          if (result && result.pendingContact) {
+            pendingContactRequest = result.pendingContact;
+            const askMsg = `I don't have ${result.pendingContact.field === 'email' ? 'an email' : 'a number'} saved for ${result.pendingContact.name} — what is it?`;
+            updateMessage(bubble, askMsg);
+            pushHistory('assistant', askMsg);
+            speak(askMsg);
+            setState('idle');
+            return;
+          }
+          if (result) {
+            let msg;
+            if (result.ok) {
+              const opened = triggerDeepLink(result.url, result.sameTab);
+              msg = result.confirm;
+              if (!result.sameTab && !opened) msg += " (Your browser's pop-up blocker may have stopped that — allow pop-ups for this site and try again.)";
+            } else {
+              msg = result.message;
+            }
+            updateMessage(bubble, msg);
+            pushHistory('assistant', msg);
+            speak(msg);
+            setState('idle');
+            return;
+          }
         }
       }
 
