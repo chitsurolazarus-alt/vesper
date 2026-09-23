@@ -18,6 +18,21 @@ SAFETY MODEL (as requested):
     approve it from the Vesper web page before continuing. Gemini's own
     built-in safety checks (e.g. on sensitive on-screen actions) are routed
     through the same approval bar.
+  - Sending or submitting something via a plain screen click/keystroke — a
+    "Send" button in Outlook/WhatsApp/Slack/Teams, pressing Enter in a chat
+    app, "Submit", "Post", "Publish", "Pay", "Place order" — is a GENERIC
+    computer-use click/type action with no special tool name, so it's caught
+    two independent ways: (1) Gemini's own safety_decision field on the
+    action itself, when it flags one of its built-in categories
+    (communication_tool, financial_transactions, etc.), and (2) a local
+    backstop that reads the free-text `intent` Gemini writes for every
+    click/type action (e.g. "Click Send to email X the message: Y") and
+    pauses on send/submit/post/publish/pay-type verbs regardless of what
+    Gemini's own judgment did. Either one pausing is enough to show the
+    confirm bar — see RISKY_INTENT_RE and the safety_decision handling in
+    run_agent_loop() below. This is a backstop, not a certainty: it depends
+    on the model's own intent text being specific, which is why PERSONA
+    explicitly asks for that.
   - Every action is written to agent_log.txt next to this file, so there's
     always a record of exactly what Vesper did.
   - Each run is capped at MAX_STEPS actions so a confused loop can't run
@@ -40,6 +55,7 @@ import base64
 import io
 import json
 import os
+import re
 import subprocess
 import threading
 import time
@@ -81,7 +97,15 @@ PERSONA = (
     "in Cape Town who runs a small digital agency. Be efficient: look at the "
     "screen, act, and confirm what happened in plain language at the end. Don't "
     "narrate every intermediate step out loud — just do the task and report the "
-    "result in 1-3 sentences when you're done."
+    "result in 1-3 sentences when you're done.\n\n"
+    "Important: whenever you click, tap, or press Enter on something that will "
+    "send a message, submit a form, publish a post, place an order, or make a "
+    "payment on the user's behalf, write that action's own intent description "
+    "explicitly and specifically — name what is being sent and to whom/where "
+    "(e.g. \"Click Send to email john@example.com the message: running 10 "
+    "minutes late\"), not a vague \"click Send button\". A local safety check "
+    "reads that description before letting the action through, so a vague one "
+    "may fail to pause when it should."
 )
 
 app = Flask(__name__)
@@ -353,6 +377,46 @@ def is_extra_risky_shell(tool_input):
 
 
 # ---------------------------------------------------------------------------
+# Send/submit confirmation backstop for computer-use clicks and keystrokes
+# ---------------------------------------------------------------------------
+#
+# Gemini's computer-use tool has its own built-in safety check: a risky
+# action can come back with `arguments.safety_decision = {"decision":
+# "require_confirmation", "explanation": "..."}` (confirmed against Google's
+# docs at ai.google.dev/gemini-api/docs/computer-use — this is a real field,
+# nested inside the function call's own arguments dict, not a made-up shape).
+# That's handled below in run_agent_loop.
+#
+# It is NOT reliable enough to be the only gate, though — it's Gemini's own
+# judgment call about what counts as risky, tuned for its own predefined
+# categories (financial_transactions, communication_tool, etc.), and there's
+# no guarantee it fires for every "click Send in some third-party desktop
+# app" scenario. As a backstop that doesn't depend on Gemini flagging itself,
+# every click/type action ALSO carries a model-written `intent` string (e.g.
+# "Click the Send button to submit the email") — also confirmed against
+# Google's docs, present on every computer-use action, not just risky ones.
+# RISKY_INTENT_RE checks that text for send/submit/publish/pay-type verbs and
+# routes the match through the exact same _await_confirmation()/confirm-bar
+# flow already used for the four custom tools, independent of whether Gemini
+# itself asked for confirmation.
+RISKY_INTENT_ACTIONS = {"click", "double_click", "type"}
+RISKY_INTENT_RE = re.compile(
+    r"\b(send|submit|post|publish|pay|purchase|buy now|check ?out|"
+    r"place (the |your )?order|confirm (the |your )?order)\b",
+    re.IGNORECASE,
+)
+
+
+def looks_like_risky_send(intent_text):
+    return bool(intent_text) and bool(RISKY_INTENT_RE.search(intent_text))
+
+
+def describe_risky_send(intent_text, last_typed_text):
+    preview = f' Last text typed on screen: "{last_typed_text[:200]}"' if last_typed_text else ""
+    return f'Vesper is about to do this: "{intent_text}".{preview} Send it?'
+
+
+# ---------------------------------------------------------------------------
 # Computer-use action execution (Gemini's predefined desktop/browser actions)
 # ---------------------------------------------------------------------------
 
@@ -523,9 +587,31 @@ def run_agent_loop(task_id, user_text):
                 function_responses.append(_result(name, call_id, str(output)))
 
             elif name in COMPUTER_USE_ACTIONS:
-                execute_computer_action(name, args if isinstance(args, dict) else {})
+                cu_args = args if isinstance(args, dict) else {}
+                intent_text = cu_args.get("intent") or ""
+                if name == "type" and cu_args.get("text"):
+                    state["last_typed_text"] = cu_args.get("text")
+
+                # Backstop: only runs when Gemini's OWN safety_decision didn't
+                # already gate this action above — this is the second,
+                # independent check, not a replacement for it.
+                if not approved_already and name in RISKY_INTENT_ACTIONS and looks_like_risky_send(intent_text):
+                    description = describe_risky_send(intent_text, state.get("last_typed_text"))
+                    approved_already = _await_confirmation(state, description)
+                    if not approved_already:
+                        function_responses.append(_result(name, call_id, "The user denied this action. Do not retry it.", is_error=True, screenshot=take_screenshot_bytes()))
+                        continue
+
+                execute_computer_action(name, cu_args)
                 shot = take_screenshot_bytes()
-                function_responses.append(_result(name, call_id, {"ok": True}, screenshot=shot))
+                result_value = {"ok": True}
+                if approved_already:
+                    # Per Google's computer-use docs, the model expects this
+                    # flag back on the result once a human has approved a
+                    # confirmation-gated action, whether Gemini's own
+                    # safety_decision asked for it or our own backstop did.
+                    result_value["safety_acknowledgement"] = True
+                function_responses.append(_result(name, call_id, result_value, screenshot=shot))
 
             else:
                 function_responses.append(_result(name, call_id, f"Unknown tool '{name}'", is_error=True))
@@ -595,6 +681,7 @@ def command():
         "pending": None,
         "approved": False,
         "confirm_event": threading.Event(),
+        "last_typed_text": None,
     }
     thread = threading.Thread(target=run_agent_loop, args=(task_id, text), daemon=True)
     thread.start()
