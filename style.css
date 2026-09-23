@@ -467,6 +467,10 @@ body{background:var(--bg); overflow-x:hidden;}
   background:rgba(3,6,10,.6);
   backdrop-filter:blur(4px); -webkit-backdrop-filter:blur(4px);
 }
+/* display:flex above would otherwise permanently override the [hidden]
+   attribute's UA-stylesheet display:none, since author CSS always wins
+   over the browser default regardless of the attribute being present. */
+.settings-overlay[hidden]{ display:none; }
 .settings-card{
   width:100%; max-width:420px; max-height:min(80vh,640px);
   display:flex; flex-direction:column; gap:12px;
