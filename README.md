@@ -1,6 +1,6 @@
 # Vesper
 
-A voice-and-text AI assistant with a HUD/reactor-core interface — vanilla HTML, CSS and JavaScript on the frontend. Plain conversation runs through Groq (fast, via a Supabase Edge Function so the key never touches the browser); real desktop control (System Control) runs through Google Gemini via a separate local agent, since that's the one with a free-tier computer-use tool. The whole stack is free: no paid API is required anywhere.
+A voice-and-text AI assistant with a HUD/reactor-core interface — vanilla HTML, CSS and JavaScript on the frontend. Plain conversation runs through Groq (fast, via a Supabase Edge Function so the key never touches the browser); real desktop control (System Control) runs through a separate local agent (Gemini by default, Groq optional) that reads apps through Windows UI Automation. The whole stack is free: no paid API is required anywhere.
 
 ## What's in here
 
@@ -104,11 +104,26 @@ All of these are free — no new paid API or service was added.
 
 `agent/vesper_agent.py` is a separate local Python server that gives Vesper real
 control over this computer: opening/closing programs, running commands,
-reading/writing files, and — using Gemini's vision — actually seeing your
-screen and clicking/typing anywhere, the way you would. This has to be a
-separate process from the web page, because a browser tab is never allowed
-to reach outside itself to control other applications; that's not a
-limitation of this app, it's a security boundary every browser enforces.
+reading/writing files, and operating other Windows apps' UI (click, type, press
+keys, read what's on screen). This has to be a separate process from the web
+page, because a browser tab is never allowed to reach outside itself to control
+other applications; that's not a limitation of this app, it's a security
+boundary every browser enforces.
+
+### How it sees and controls the screen (changed from the earlier version)
+
+It no longer takes screenshots and guesses pixel coordinates. It uses
+[cua-driver](https://pypi.org/project/cua-driver/) (MIT), which reads apps through
+**Windows UI Automation** and gives the model the screen as a **text tree of
+UI elements** (`[12] Button "Send"`). The model acts by element, not by pixel.
+Because the model only ever reads text and calls ordinary tools, the reasoning
+model is swappable: `VESPER_REASONER=gemini` (default) or `groq` (see `llm.py`).
+
+**The real ceiling of this approach:**
+- It only works on apps that expose a usable UI Automation tree. Standard Windows/Win32/WPF/UWP apps and browsers generally do; games, canvas-rendered UIs, remote-desktop windows and some Electron apps expose little or nothing, and there is **no vision fallback** — if an element isn't in the tree, Vesper can't act on it and should say so.
+- Element indices go stale when a window changes, so it re-reads the tree after acting. Multi-step GUI work can still misstep.
+- `type_text` into a text element writes through UI Automation's ValuePattern. In one test that **appended the text to the end of an already-open Notepad document** rather than typing at the cursor — so "typing" is not always identical to keystrokes at the caret.
+- It acts on whichever matching window it finds, including one you already have open with unsaved work. During testing a scripted "type into Notepad" landed in an existing unsaved Notepad tab. Don't run System Control tasks against windows holding work you can't afford to touch.
 
 ### Setup
 
@@ -119,32 +134,56 @@ limitation of this app, it's a security boundary every browser enforces.
    pip install -r requirements.txt
    ```
 3. Get a **free** Gemini API key: go to **[aistudio.google.com](https://aistudio.google.com)** → sign in with a Google account → **Get API key** → **Create API key**. No card is required for the free tier (worth double-checking current terms on Google's site, since that can change).
-4. Copy `agent/.env.example` to `agent/.env` and paste in that key as `GEMINI_API_KEY`.
+4. Copy `agent/.env.example` to `agent/.env` and paste in that key as `GEMINI_API_KEY`. To use Groq instead, set `GROQ_API_KEY` and `VESPER_REASONER=groq` (see the untested note below).
 5. Start it:
    ```bash
    python vesper_agent.py
    ```
-   It listens on `http://127.0.0.1:7891` and prints your detected screen resolution.
+   It listens on `http://127.0.0.1:7891`.
 6. With `index.html` open (via Live Server), click the **SYSTEM CONTROL: OFF** pill at the top of the page to switch it on. It'll turn amber and say **ON** once it confirms the agent is reachable.
 7. Now try something like *"open Notepad and type a haiku about the ocean"* or *"what processes are running right now?"*
 
+### Quick toggles (no AI in the loop)
+
+With System Control on, these exact phrases skip the model and run deterministically:
+*"mute"* / *"unmute"*, *"turn on/off do not disturb"* (or *"toggle dnd"*), and *"lock my computer/pc/screen"*. Endpoint: `POST /quick`.
+
+- **Mute** uses Windows Core Audio (pycaw) and reads the state back. Muting twice never un-mutes. This is the **system** volume mute, not Vesper's own voice-mute button.
+- **Do Not Disturb** has **no supported Windows API** (on Windows 11 the registry value that looks like it is actually the master "Notifications" switch). So Vesper drives the real Settings → Notifications switch through UI Automation. It takes roughly 5–7 seconds, briefly opens the Settings window, and matches the English label "Do not disturb" — a non-English Windows or a redesigned Settings page will break it (it reports failure rather than claiming success). Its read-back checks the Settings switch it just clicked; it doesn't independently confirm what the OS notification engine is doing.
+- **Lock** calls `LockWorkStation()` (same as Win+L) with no confirmation, deliberately: it's harmless and you can undo it by unlocking.
+
 ### How the safety model works
 
-- Opening apps, moving/clicking/typing on screen, reading files, and listing processes happen immediately — no prompt, since you asked for full desktop control.
-- Closing a program, running a shell command, writing a file, or deleting anything **pauses and shows an Approve/Deny bar** on the page before it happens. Nothing risky runs without you clicking Approve.
-- **Sending or submitting something on your behalf — via a plain screen click or keystroke — also pauses for approval.** This is the important one to understand: a "Send" button in Outlook, WhatsApp Desktop, Slack, or Teams, pressing Enter in a chat app, "Submit", "Post", "Publish", "Pay", or "Place order" are all just generic clicks/keystrokes to the computer-use tool — there's no dedicated "send_message" tool name for it to key off of the way there is for closing an app or deleting a file. So this is caught two independent ways instead:
-  1. **Gemini's own built-in safety check.** Every computer-use action can come back flagged with `safety_decision: {"decision": "require_confirmation", ...}` when it matches one of Gemini's own risk categories (communication, payments, account creation, etc.) — the agent routes that through the same Approve/Deny bar as the four custom tools.
-  2. **A local backstop that doesn't rely on Gemini flagging itself.** Every click/keystroke Gemini performs also carries a short free-text `intent` it wrote describing that specific action (e.g. *"Click Send to email john@example.com the message: running late"*). The agent scans that text for send/submit/post/publish/pay/purchase/checkout/place-order-type verbs and pauses independently of whatever Gemini's own judgment did, showing you a preview of what's about to go out (built from that intent text plus the last thing it typed on screen) before you approve or deny it.
+- Opening apps, clicking/typing in apps, reading files, and listing processes happen immediately — no prompt, since you asked for full desktop control.
+- Closing a program, running a shell command, writing a file, or deleting anything **pauses and shows an Approve/Deny bar** on the page before it happens.
+- **Sending or submitting something on your behalf — via a plain click or keystroke — also pauses for approval.** A "Send" button in Outlook/WhatsApp/Slack/Teams, "Submit", "Post", "Publish", "Pay", "Place order" are ordinary clicks with no dedicated tool name to key off, so they're caught two independent ways:
+  1. **The real label of the element being clicked.** The agent resolves each click's `element_index` to the actual element in the UI tree and matches its label against send/submit/post/publish/pay/purchase/checkout/place-order. This doesn't depend on the model saying anything honest.
+  2. **The model's own `intent` text.** Every action must carry a plain-language description (*"Click Send to email john@example.com the message: running late"*). The same verbs are matched there too.
 
-  Neither mechanism is a certainty on its own — Gemini's own check depends on its built-in categories catching your specific case, and the local backstop depends on the model writing a specific-enough `intent` (which the system prompt explicitly asks it to do). Either one pausing is enough to show the confirm bar, which is why there are two independent checks rather than one.
-- Every action (approved or not) is written to `agent/agent_log.txt`, so there's always a plain record of what Vesper actually did.
-- Each request is capped at 25 actions, so a confused task can't loop forever — it'll stop and tell you to ask again.
-- `pyautogui`'s built-in failsafe is on: slam your mouse cursor into a screen corner at any time to immediately abort whatever it's doing.
+  Either one pausing shows the confirm bar. **Ctrl+Enter / Alt+Enter is always gated** (the Send shortcut in many mail/chat apps).
+- **Known gap:** a bare **Enter** keypress with no element and a vague intent (e.g. sending a chat message by pressing Enter with intent *"confirm"*) is **not caught** by either check. This was confirmed in a unit test, not just reasoned about.
+- The model can only name the screen tools listed in `EXPOSED_CUA_TOOLS` in `vesper_agent.py`. `kill_app`, `clipboard_read`/`clipboard_write`, `set_config`, and the browser `page` tool are never offered to it, and a made-up tool name is rejected.
+- cua-driver has its own permission layer underneath (`VESPER_CUA_MODE`): `standard` (default) or `bounded` (deny-by-default, needs a reviewed manifest in `VESPER_CUA_MANIFEST`). `unrestricted` is deliberately not exposed. Anything cua-driver asks the host to authorize is denied and logged.
+- Every action (approved or not) is written to `agent/agent_log.txt`.
+- Each request is capped at 25 actions, so a confused task can't loop forever.
+
+### What has and hasn't been verified
+
+Verified by real runs on this machine (Windows 11):
+- The full agent loop against the real cua-driver, using a scripted stand-in for the model: open → list windows → read UI tree → type → read back confirmed the text landed. Element-index-to-token resolution worked.
+- The send gate's logic (unit tests, 9 cases pass; one documented gap above), and that a **denied** gated click never reaches the driver.
+- Real Gemini accepts all tool schemas and completes a multi-turn read-only task correctly (list windows → answer, checked against the actual window list).
+- Mute and Do Not Disturb toggles round-trip and restore correctly; `/quick` and `/health` respond correctly.
+
+**Not verified — treat as unproven:**
+- **The send gate against a real "Send" button in Outlook, WhatsApp Desktop, Slack or Teams.** The label check was exercised with a fabricated element labelled "Send", not a live mail client. Whether real apps expose their Send button with a label the regex matches is unconfirmed.
+- **Groq as the reasoner.** No Groq key was available locally, so `GroqReasoner` has never made a real call. Its request/response handling follows Groq's OpenAI-compatible format but is untested.
+- **`lock`** was not run (it would lock the session). **`bounded` mode** was not run.
+- **Reliability on hard apps.** Only simple tasks were tried. Expect misses on complex, multi-window or fast-changing UIs.
 
 ### Important things to know
 
-- **This is powerful.** The agent can see your whole screen and act on anything on it, including things outside this project. Only run it when you intend to use it, and treat the GEMINI_API_KEY in `agent/.env` like a password — it's gitignored, keep it that way.
-- **It's beta technology.** Gemini's computer-use tool (the vision-based screen control) is a newer capability and won't be perfectly reliable — it can misclick, misread small text, or need a couple of tries on fiddly UI. It's genuinely good at things like "open X and type Y" or "check if Y is running"; it's more error-prone on precise, fast, multi-step GUI work. Verified working end-to-end (a plain "take a screenshot and describe what's focused" task ran successfully), but note the free tier caps computer-use specifically at **20 requests/day** — each step of a task uses one request, so a handful of multi-step tasks can exhaust it; the error message will say so plainly if you hit it. In practice this limit is tight enough that a single "compose and send an email" task can burn through it before finishing, as happened during testing of the send-confirmation feature below.
-- **The send-confirmation backstop is implemented and reasoned through against Google's documented `safety_decision`/`intent` field shapes, and unit-tested in isolation (the regex that flags send/submit/publish-type intent text) — but has not yet been confirmed end-to-end against a real "click Send" in Outlook or WhatsApp Desktop.** A live test got partway through (Outlook opened, recipient field filled correctly) before hitting the 20-requests/day cap, so whether the confirm bar actually appears at the real Send click hasn't been directly observed yet. Worth a real end-to-end run once quota resets before relying on it for anything that actually matters.
-- **The model name and response handling in `vesper_agent.py` may need updating over time** — check [ai.google.dev/gemini-api/docs](https://ai.google.dev/gemini-api/docs) if it stops working after a while; Google occasionally changes model names and API shapes as the tool evolves.
-- Close the terminal running `vesper_agent.py` (or Ctrl+C) any time to shut the agent down completely — the web page keeps working for plain conversation either way, it just falls back to the Supabase path.
+- **This is powerful.** The agent can read and act on anything on your screen, including things outside this project. Only run it when you intend to use it, and treat the API keys in `agent/.env` like passwords — it's gitignored, keep it that way.
+- **Free-tier limits are tight and real.** Gemini's free tier has been observed returning `429` (a 20-requests/day cap on this model) and `503` ("high demand") on this account. Each step of a task is one request. The agent retries transient 503s and short rate limits a few times, but does **not** retry a per-day cap (it won't clear in a minute) and will say so plainly.
+- **Model names and SDK shapes change.** Check [ai.google.dev/gemini-api/docs](https://ai.google.dev/gemini-api/docs) and [console.groq.com/docs/models](https://console.groq.com/docs/models) if it stops working after a while.
+- Close the terminal running `vesper_agent.py` (or Ctrl+C) any time to shut the agent down completely — the web page keeps working for plain conversation either way. `pyautogui`'s corner-slam failsafe no longer applies, since the agent no longer uses `pyautogui`.

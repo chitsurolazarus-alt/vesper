@@ -527,6 +527,43 @@
     confirmDeny.onclick = () => { cleanup(); onDecision(false); };
   }
 
+  // Direct toggles (mute / Do Not Disturb / lock) skip the AI loop entirely —
+  // the agent does them deterministically and verifies the result. Patterns are
+  // deliberately narrow so ordinary requests still go to the normal path.
+  const QUICK_TOGGLES = [
+    { re: /^\s*(please\s+)?unmute(\s+(the\s+)?(computer|pc|sound|volume|audio|speakers?))?\s*[.!]?\s*$/i, action: 'unmute' },
+    { re: /^\s*(please\s+)?mute(\s+(the\s+)?(computer|pc|sound|volume|audio|speakers?))?\s*[.!]?\s*$/i, action: 'mute' },
+    { re: /^\s*(please\s+)?(turn on|enable|start)\s+(do not disturb|dnd)\s*[.!]?\s*$/i, action: 'dnd_on' },
+    { re: /^\s*(please\s+)?(turn off|disable|stop)\s+(do not disturb|dnd)\s*[.!]?\s*$/i, action: 'dnd_off' },
+    { re: /^\s*(please\s+)?toggle\s+(do not disturb|dnd)\s*[.!]?\s*$/i, action: 'toggle_dnd' },
+    { re: /^\s*(please\s+)?lock\s+(my|the)\s+(computer|pc|screen|laptop)\s*[.!]?\s*$/i, action: 'lock' },
+  ];
+
+  async function runQuickToggle(action, text) {
+    setState('thinking');
+    const slow = action.includes('dnd');
+    const bubble = appendMessage('vesper', slow ? 'On it — Do Not Disturb takes a few seconds (I have to flip it in Settings)…' : 'On it…');
+    let msg;
+    try {
+      const resp = await fetch(`${AGENT_URL}/quick`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ action })
+      });
+      const data = await resp.json();
+      msg = data.message || (data.ok ? 'Done.' : "That didn't work.");
+      if (!data.ok) markError(bubble);
+    } catch (e) {
+      msg = "Couldn't reach the local Vesper Agent — make sure vesper_agent.py is running.";
+      markError(bubble);
+    }
+    updateMessage(bubble, msg);
+    pushHistory('user', text);
+    pushHistory('assistant', msg);
+    setState('idle');
+    speak(msg);
+  }
+
   async function runAgentCommand(text) {
     setState('thinking');
     const bubble = appendMessage('vesper', 'Working on it…');
@@ -1043,6 +1080,8 @@ Respond with ONLY compact JSON, no prose, no markdown code fences, matching this
     }
 
     if (agentOn && agentReachable) {
+      const toggle = QUICK_TOGGLES.find(t => t.re.test(text));
+      if (toggle) return runQuickToggle(toggle.action, text);
       return runAgentCommand(text);
     }
 

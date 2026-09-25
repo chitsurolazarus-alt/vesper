@@ -1,8 +1,14 @@
 """
 Vesper Agent — a local companion server that gives Vesper real control over
 this computer: opening/closing programs, running commands, managing files,
-and seeing + clicking/typing anywhere on screen (like a human would), driven
-by Gemini's computer-use tool (free tier, no credit card required).
+and operating any Windows app's UI (click, type, press keys, read what's on
+screen) the way a person would.
+
+Screen control goes through cua-driver, which reads apps through Windows UI
+Automation and hands the model the screen as TEXT (an element tree), so the
+reasoning model only needs ordinary tool calling. That makes the model
+swappable (Gemini or Groq — see llm.py and VESPER_REASONER). Quick toggles
+(mute, Do Not Disturb, lock) skip the model entirely — see toggles.py.
 
 This is intentionally a SEPARATE process from the web UI (index.html), and it
 needs to be, because a browser tab can never reach outside itself to control
@@ -10,49 +16,32 @@ other applications — that's a security boundary the browser enforces, not
 something the web app can opt out of. This script runs directly on your
 machine with real permissions instead.
 
-SAFETY MODEL (as requested):
-  - Opening a known app, reading files/dirs, moving the mouse, clicking,
-    typing, and taking screenshots happen immediately — no prompt.
-  - Anything the agent itself flags as risky — closing an app, running a
-    shell command, writing or deleting a file — PAUSES and waits for you to
-    approve it from the Vesper web page before continuing. Gemini's own
-    built-in safety checks (e.g. on sensitive on-screen actions) are routed
-    through the same approval bar.
-  - Sending or submitting something via a plain screen click/keystroke — a
-    "Send" button in Outlook/WhatsApp/Slack/Teams, pressing Enter in a chat
-    app, "Submit", "Post", "Publish", "Pay", "Place order" — is a GENERIC
-    computer-use click/type action with no special tool name, so it's caught
-    two independent ways: (1) Gemini's own safety_decision field on the
-    action itself, when it flags one of its built-in categories
-    (communication_tool, financial_transactions, etc.), and (2) a local
-    backstop that reads the free-text `intent` Gemini writes for every
-    click/type action (e.g. "Click Send to email X the message: Y") and
-    pauses on send/submit/post/publish/pay-type verbs regardless of what
-    Gemini's own judgment did. Either one pausing is enough to show the
-    confirm bar — see RISKY_INTENT_RE and the safety_decision handling in
-    run_agent_loop() below. This is a backstop, not a certainty: it depends
-    on the model's own intent text being specific, which is why PERSONA
-    explicitly asks for that.
-  - Every action is written to agent_log.txt next to this file, so there's
-    always a record of exactly what Vesper did.
+SAFETY MODEL:
+  - Opening a known app, reading files/dirs, reading the screen, clicking and
+    typing happen immediately — no prompt.
+  - Closing an app, running a shell command, writing or deleting a file PAUSE
+    and wait for you to approve from the Vesper web page.
+  - Sending or submitting something through the UI (a "Send" button, Ctrl+Enter,
+    "Submit", "Post", "Publish", "Pay", "Place order") is a plain click or
+    keypress with no special tool name, so it's caught two independent ways
+    (see RISKY_INTENT_RE and check_ui_action_risk below): (1) the real label of
+    the element being clicked, resolved by this server from the UI tree — it
+    doesn't depend on the model being honest — and (2) the free-text `intent`
+    the model must attach to every action. Either one pausing shows the confirm
+    bar. Known gap: a bare Enter keypress with no element and a vague intent
+    can slip past both; Ctrl/Alt+Enter is always gated.
+  - The model can only name tools in EXPOSED_CUA_TOOLS. kill_app,
+    clipboard_read/write, set_config, browser `page` and the like are never
+    offered to it.
+  - Every action is written to agent_log.txt next to this file.
   - Each run is capped at MAX_STEPS actions so a confused loop can't run
     forever.
 
 Run it with:  python vesper_agent.py
 It listens on http://127.0.0.1:7891 — the Vesper web page talks to it there
 when you turn on "System Control" in the UI.
-
-IMPORTANT: Gemini's computer-use tool (the "Interactions API" used below) is
-a newer capability. The exact response object's attribute names are read
-defensively here (several fallbacks per field) because the SDK is still
-evolving — if you hit an AttributeError when this actually runs, check
-https://ai.google.dev/gemini-api/docs/computer-use for the current shape of
-`client.interactions.create(...)`'s return value and adjust the `_get`
-helper calls below accordingly.
 """
 
-import base64
-import io
 import json
 import os
 import re
@@ -67,55 +56,83 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import psutil
-import pyautogui
-from google import genai
 from flask import Flask, jsonify, request
 from flask_cors import CORS
+
+import toggles
+from llm import ReasonerError, make_reasoner
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-# Verify this is still current / check free-tier status at
-# https://ai.google.dev/gemini-api/docs/computer-use and
-# https://ai.google.dev/gemini-api/docs/pricing
-MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
-ENVIRONMENT = os.environ.get("VESPER_AGENT_ENVIRONMENT", "desktop")
-
 PORT = int(os.environ.get("VESPER_AGENT_PORT", "7891"))
 MAX_STEPS = 25
 LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "agent_log.txt")
 
-SCREEN_WIDTH, SCREEN_HEIGHT = pyautogui.size()
-pyautogui.FAILSAFE = True  # slam the mouse to a screen corner to abort a pyautogui action
+# cua-driver's own permission layer, underneath Vesper's confirm bar:
+#   standard (default) — promptless routine automation
+#   bounded            — deny-by-default; needs VESPER_CUA_MANIFEST pointing at a
+#                        reviewed capability manifest
+CUA_MODE = os.environ.get("VESPER_CUA_MODE", "standard").lower()
+CUA_MANIFEST = os.environ.get("VESPER_CUA_MANIFEST")
 
 PERSONA = (
     "You are VESPER, an AI assistant with real control over the user's Windows "
-    "computer through function tools and a computer-use tool that lets you see "
-    "the screen and click/type on it. The user is Lazarus, a software developer "
-    "in Cape Town who runs a small digital agency. Be efficient: look at the "
-    "screen, act, and confirm what happened in plain language at the end. Don't "
-    "narrate every intermediate step out loud — just do the task and report the "
-    "result in 1-3 sentences when you're done.\n\n"
-    "Important: whenever you click, tap, or press Enter on something that will "
-    "send a message, submit a form, publish a post, place an order, or make a "
-    "payment on the user's behalf, write that action's own intent description "
-    "explicitly and specifically — name what is being sent and to whom/where "
+    "computer. The user is Lazarus, a software developer in Cape Town who runs "
+    "a small digital agency. Be efficient: do the task, then report the result "
+    "in 1-3 sentences. Don't narrate every intermediate step.\n\n"
+    "You cannot see pixels. You see apps as a text tree of UI elements. The "
+    "workflow is: (1) open_application or list_windows to find the app's pid and "
+    "window_id; (2) get_window_state to read its elements — each line is "
+    "`[index] Role \"label\"`; (3) act with click / type_text / press_key / "
+    "hotkey / set_value using element_index from THAT most recent "
+    "get_window_state; (4) call get_window_state again to confirm the action "
+    "worked before you claim it did. Indices go stale after the window changes, "
+    "so re-read the state after every action that changes the UI. If an element "
+    "you need isn't in the tree, say so plainly instead of guessing.\n\n"
+    "Every action tool takes an `intent`. Whenever an action will send a "
+    "message, submit a form, publish a post, place an order, or make a payment, "
+    "write the intent explicitly — name what is being sent and to whom/where "
     "(e.g. \"Click Send to email john@example.com the message: running 10 "
-    "minutes late\"), not a vague \"click Send button\". A local safety check "
-    "reads that description before letting the action through, so a vague one "
-    "may fail to pause when it should."
+    "minutes late\"), not a vague \"click button\". A local safety check "
+    "reads it before the action runs. If the user denies an action, do not "
+    "retry it."
 )
 
 app = Flask(__name__)
 CORS(app)
 
-client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
-
 # task_id -> state dict. This is intentionally simple in-memory state — this
 # server is meant for one user on one machine, not a multi-tenant service.
 TASKS = {}
+
+# Lazily started so /health and the plain-file tools work even when
+# cua-driver isn't installed or fails to initialise.
+_bridge = None
+_bridge_error = None
+_bridge_lock = threading.Lock()
+
+
+def get_bridge():
+    """Returns (bridge, error_message). Starts cua-driver on first use."""
+    global _bridge, _bridge_error
+    with _bridge_lock:
+        if _bridge is not None:
+            return _bridge, None
+        if _bridge_error:
+            return None, _bridge_error
+        try:
+            from cua_bridge import CuaBridge
+            b = CuaBridge(mode=CUA_MODE, manifest_path=CUA_MANIFEST, log=lambda m: log(m))
+            b.start()
+            _bridge = b
+            log(f"cua-driver started (mode={CUA_MODE})")
+            return _bridge, None
+        except Exception as e:
+            _bridge_error = f"cua-driver couldn't start: {e}"
+            log(_bridge_error)
+            return None, _bridge_error
 
 
 def log(line):
@@ -305,43 +322,36 @@ RISKY_TOOLS = {"close_application", "run_shell_command", "write_text_file", "del
 
 CUSTOM_TOOL_SCHEMAS = [
     {
-        "type": "function",
         "name": "open_application",
         "description": "Launch a desktop application by name (e.g. 'Notepad', 'Chrome', 'VS Code', 'Spotify'). Does not require approval.",
         "parameters": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]},
     },
     {
-        "type": "function",
         "name": "close_application",
         "description": "Terminate all running processes whose name matches. Requires user approval before it runs.",
         "parameters": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]},
     },
     {
-        "type": "function",
         "name": "list_processes",
         "description": "List the names of currently running processes. Does not require approval.",
         "parameters": {"type": "object", "properties": {}},
     },
     {
-        "type": "function",
         "name": "run_shell_command",
         "description": "Run a Windows shell (cmd.exe) command and return its output. Requires user approval before it runs.",
         "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]},
     },
     {
-        "type": "function",
         "name": "list_directory",
         "description": "List files and folders at a path. Does not require approval.",
         "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]},
     },
     {
-        "type": "function",
         "name": "read_text_file",
         "description": "Read a text file's contents (first 20,000 characters). Does not require approval.",
         "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]},
     },
     {
-        "type": "function",
         "name": "write_text_file",
         "description": "Create or overwrite a text file with the given content. Requires user approval before it runs.",
         "parameters": {
@@ -351,7 +361,6 @@ CUSTOM_TOOL_SCHEMAS = [
         },
     },
     {
-        "type": "function",
         "name": "delete_path",
         "description": "Delete a single file, or an empty folder. Requires user approval before it runs.",
         "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]},
@@ -377,128 +386,209 @@ def is_extra_risky_shell(tool_input):
 
 
 # ---------------------------------------------------------------------------
-# Send/submit confirmation backstop for computer-use clicks and keystrokes
+# Screen control tools (cua-driver) — what the model is allowed to name
 # ---------------------------------------------------------------------------
 #
-# Gemini's computer-use tool has its own built-in safety check: a risky
-# action can come back with `arguments.safety_decision = {"decision":
-# "require_confirmation", "explanation": "..."}` (confirmed against Google's
-# docs at ai.google.dev/gemini-api/docs/computer-use — this is a real field,
-# nested inside the function call's own arguments dict, not a made-up shape).
-# That's handled below in run_agent_loop.
+# Hand-written schemas rather than cua-driver's own: they're smaller (fewer
+# tokens per step), portable across Gemini and Groq, and they let this server
+# require an `intent` on every action and resolve `element_index` itself. The
+# model never gets raw pixel coordinates — it has no screenshot to pick them
+# from — so every click is tied to a real element whose label we can check.
+
+_INTENT = {"type": "string", "description": "Plain-language description of exactly what this action does and why. For anything that sends/submits/posts/pays, name what and to whom."}
+_PID = {"type": "integer", "description": "Process id from list_windows."}
+_WID = {"type": "integer", "description": "window_id from list_windows."}
+_EL = {"type": "integer", "description": "element_index from the most recent get_window_state of this same window."}
+
+
+def _t(name, description, props, required):
+    return {"name": name, "description": description,
+            "parameters": {"type": "object", "properties": props, "required": required}}
+
+
+CUA_TOOL_SCHEMAS = [
+    _t("list_windows", "List top-level windows (pid, window_id, title, app_name).", {}, []),
+    _t("get_window_state",
+       "Read one window's UI as a text tree: each line is `[index] Role \"label\"`. Call this before acting and again after to verify. Use `query` (substring) to narrow a big window.",
+       {"pid": _PID, "window_id": _WID, "query": {"type": "string"}}, ["pid", "window_id"]),
+    _t("click", "Click an element (or double-click with count=2).",
+       {"pid": _PID, "window_id": _WID, "element_index": _EL, "count": {"type": "integer", "description": "1 (default) or 2."}, "intent": _INTENT},
+       ["pid", "window_id", "element_index", "intent"]),
+    _t("type_text", "Type text into an element (by element_index) or into whatever has focus in the window.",
+       {"pid": _PID, "window_id": _WID, "text": {"type": "string"}, "element_index": _EL, "intent": _INTENT},
+       ["pid", "window_id", "text", "intent"]),
+    _t("set_value", "Set an edit field's value directly (faster and more reliable than typing for plain text fields).",
+       {"pid": _PID, "window_id": _WID, "element_index": _EL, "value": {"type": "string"}, "intent": _INTENT},
+       ["pid", "window_id", "element_index", "value", "intent"]),
+    _t("press_key", "Press one key (return, tab, escape, up, down, delete, f1-f12, a letter...), optionally with modifiers.",
+       {"pid": _PID, "window_id": _WID, "key": {"type": "string"}, "modifiers": {"type": "array", "items": {"type": "string"}, "description": "ctrl / shift / alt / win"}, "element_index": _EL, "intent": _INTENT},
+       ["pid", "window_id", "key", "intent"]),
+    _t("hotkey", "Press a key combination, e.g. [\"ctrl\", \"s\"].",
+       {"pid": _PID, "window_id": _WID, "keys": {"type": "array", "items": {"type": "string"}}, "intent": _INTENT},
+       ["pid", "window_id", "keys", "intent"]),
+    _t("scroll", "Scroll a window.",
+       {"pid": _PID, "window_id": _WID, "direction": {"type": "string", "enum": ["up", "down", "left", "right"]}, "amount": {"type": "integer"}, "intent": _INTENT},
+       ["pid", "window_id", "direction", "intent"]),
+    _t("invoke_menu", "Invoke an application-menu item by path, e.g. [\"File\", \"Save As...\"].",
+       {"pid": _PID, "window_id": _WID, "path": {"type": "array", "items": {"type": "string"}}, "intent": _INTENT},
+       ["pid", "window_id", "path", "intent"]),
+    _t("bring_to_front", "Bring a window to the foreground.", {"pid": _PID, "window_id": _WID}, ["pid"]),
+]
+
+# The allowlist is derived from the schemas above, so a tool not defined here
+# (kill_app, clipboard_read, set_config, page...) can't be reached even if a
+# model invents its name.
+EXPOSED_CUA_TOOLS = {t["name"] for t in CUA_TOOL_SCHEMAS}
+_ELEMENT_TOOLS = {"click", "type_text", "set_value", "press_key"}
+MAX_TOOL_TEXT = 14000
+
+
+# ---------------------------------------------------------------------------
+# Send/submit confirmation backstop for UI clicks and keystrokes
+# ---------------------------------------------------------------------------
 #
-# It is NOT reliable enough to be the only gate, though — it's Gemini's own
-# judgment call about what counts as risky, tuned for its own predefined
-# categories (financial_transactions, communication_tool, etc.), and there's
-# no guarantee it fires for every "click Send in some third-party desktop
-# app" scenario. As a backstop that doesn't depend on Gemini flagging itself,
-# every click/type action ALSO carries a model-written `intent` string (e.g.
-# "Click the Send button to submit the email") — also confirmed against
-# Google's docs, present on every computer-use action, not just risky ones.
-# RISKY_INTENT_RE checks that text for send/submit/publish/pay-type verbs and
-# routes the match through the exact same _await_confirmation()/confirm-bar
-# flow already used for the four custom tools, independent of whether Gemini
-# itself asked for confirmation.
-RISKY_INTENT_ACTIONS = {"click", "double_click", "type"}
+# Sending or submitting is an ordinary click or keypress with no special tool
+# name, so it can't be gated by tool. Two independent checks, either of which
+# pauses on the confirm bar:
+#   1. LABEL — this server resolves element_index to the real element from the
+#      UI tree and matches its label ("Send", "Submit", "Place order"...).
+#      Doesn't depend on the model saying anything honest.
+#   2. INTENT — the model-written description of the action. Depends on the
+#      model being specific, which is why PERSONA asks for that.
+# Ctrl/Alt+Enter is gated unconditionally: it's the Send shortcut in mail and
+# chat apps. KNOWN GAP: a bare Enter with no element_index and a vague intent
+# in a chat box is not caught by either check.
+RISKY_INTENT_ACTIONS = {"click", "type_text", "set_value", "press_key", "hotkey", "invoke_menu"}
 RISKY_INTENT_RE = re.compile(
     r"\b(send|submit|post|publish|pay|purchase|buy now|check ?out|"
     r"place (the |your )?order|confirm (the |your )?order)\b",
     re.IGNORECASE,
 )
+_ENTER_KEYS = {"return", "enter"}
+_MOD_KEYS = {"ctrl", "control", "alt"}
 
 
-def looks_like_risky_send(intent_text):
-    return bool(intent_text) and bool(RISKY_INTENT_RE.search(intent_text))
+def looks_like_risky_send(text):
+    return bool(text) and bool(RISKY_INTENT_RE.search(text))
 
 
-def describe_risky_send(intent_text, last_typed_text):
-    preview = f' Last text typed on screen: "{last_typed_text[:200]}"' if last_typed_text else ""
-    return f'Vesper is about to do this: "{intent_text}".{preview} Send it?'
-
-
-# ---------------------------------------------------------------------------
-# Computer-use action execution (Gemini's predefined desktop/browser actions)
-# ---------------------------------------------------------------------------
-
-def denormalize(x, y):
-    """Gemini returns coordinates on a 0-999 scale, independent of actual
-    screen resolution — convert to real pixels. Per Google's docs the
-    denormalization divisor is 1000 even though the range is 0-999."""
-    return int(x / 1000 * SCREEN_WIDTH), int(y / 1000 * SCREEN_HEIGHT)
-
-
-def take_screenshot_bytes():
-    img = pyautogui.screenshot()
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    return buf.getvalue()
-
-
-COMPUTER_USE_ACTIONS = {
-    "click", "double_click", "right_click", "type", "scroll", "drag_and_drop",
-    "navigate", "go_back", "go_forward", "press_key", "hotkey", "wait", "take_screenshot",
-}
-
-
-def execute_computer_action(name, args):
-    try:
-        if name == "click":
-            x, y = denormalize(args["x"], args["y"])
-            pyautogui.click(x, y)
-        elif name == "double_click":
-            x, y = denormalize(args["x"], args["y"])
-            pyautogui.doubleClick(x, y)
-        elif name == "right_click":
-            x, y = denormalize(args["x"], args["y"])
-            pyautogui.rightClick(x, y)
-        elif name == "type":
-            pyautogui.write(args.get("text", ""), interval=0.015)
-            if args.get("press_enter"):
-                pyautogui.press("enter")
-        elif name == "scroll":
-            x, y = denormalize(args.get("x", 500), args.get("y", 500))
-            pyautogui.moveTo(x, y)
-            direction = args.get("direction", "down")
-            amount = max(1, int(args.get("magnitude_in_pixels", 300)) // 20)
-            vertical = {"up": amount, "down": -amount}.get(direction)
-            if vertical is not None:
-                pyautogui.scroll(vertical)
-            else:
-                horiz = {"left": -amount, "right": amount}.get(direction, 0)
-                pyautogui.hscroll(horiz)
-        elif name == "drag_and_drop":
-            sx, sy = denormalize(args["start_x"], args["start_y"])
-            ex, ey = denormalize(args["end_x"], args["end_y"])
-            pyautogui.moveTo(sx, sy)
-            pyautogui.dragTo(ex, ey, duration=0.3)
-        elif name == "navigate":
-            # Desktop environment: best-effort via the default browser.
-            import webbrowser
-            webbrowser.open(args.get("url", ""))
-        elif name == "go_back":
-            pyautogui.hotkey("alt", "left")
-        elif name == "go_forward":
-            pyautogui.hotkey("alt", "right")
-        elif name == "press_key":
-            pyautogui.press(args.get("key", "").lower())
-        elif name == "hotkey":
-            keys = [k.lower() for k in args.get("keys", [])]
-            if keys:
-                pyautogui.hotkey(*keys)
-        elif name == "wait":
-            time.sleep(min(args.get("seconds", 1), 5))
-        elif name == "take_screenshot":
-            pass
-        else:
-            log(f"computer action: unknown action '{name}'")
-        time.sleep(0.35)
-    except Exception as e:
-        log(f"computer action '{name}' failed: {e}")
+def check_ui_action_risk(name, args, element, window_title):
+    """Returns a human-readable description if this action must be confirmed, else None."""
+    if name not in RISKY_INTENT_ACTIONS:
+        return None
+    intent = args.get("intent") or ""
+    where = f' in "{window_title}"' if window_title else ""
+    if element and name == "click" and looks_like_risky_send(element.get("label")):
+        return f'Vesper is about to click "{element.get("label")}" ({element.get("role")}){where}. Its stated intent: "{intent}". Go ahead?'
+    keys = [str(k).lower() for k in ([args.get("key")] if name == "press_key" else (args.get("keys") or [])) if k]
+    mods = {str(m).lower() for m in (args.get("modifiers") or [])} | {k for k in keys if k in _MOD_KEYS}
+    mods &= _MOD_KEYS
+    if mods and any(k in _ENTER_KEYS for k in keys):
+        return f'Vesper is about to press {"+".join(sorted(mods))}+Enter{where} — usually "Send" in mail and chat apps. Its stated intent: "{intent}". Go ahead?'
+    if looks_like_risky_send(intent):
+        return f'Vesper is about to do this{where}: "{intent}". Go ahead?'
+    return None
 
 
 # ---------------------------------------------------------------------------
-# Agent loop (Gemini Interactions API)
+# Screen control execution
 # ---------------------------------------------------------------------------
+
+def _remember_snapshot(state, data):
+    """Keep the latest element list per window so element_index can be resolved
+    to a real element (token + label) when the model acts."""
+    if not data or not data.get("window_id"):
+        return
+    key = (data.get("pid"), data["window_id"])
+    snap = state["snapshots"].get(key)
+    if not snap or snap["snapshot_id"] != data.get("snapshot_id"):
+        snap = {"snapshot_id": data.get("snapshot_id"), "title": data.get("window_title"), "elements": {}}
+        state["snapshots"][key] = snap
+    for e in data.get("elements") or []:
+        snap["elements"][e.get("element_index")] = e
+
+
+def _fmt_result(r):
+    text = r.get("text") or ""
+    if len(text) > MAX_TOOL_TEXT:
+        text = text[:MAX_TOOL_TEXT] + f"\n...[truncated {len(text) - MAX_TOOL_TEXT} chars - call get_window_state with a `query` to narrow]"
+    return text if r.get("ok") else f"ERROR: {text or r.get('error_code')}"
+
+
+def run_cua_tool(state, name, args):
+    """Executes one exposed screen tool. Returns the result text for the model."""
+    bridge, err = get_bridge()
+    if not bridge:
+        return f"ERROR: screen control is unavailable: {err}"
+
+    args = dict(args)
+    intent = args.pop("intent", "") or ""
+    call_args = {k: v for k, v in args.items() if v is not None}
+    element, title = None, None
+
+    pid, wid = args.get("pid"), args.get("window_id")
+    snap = state["snapshots"].get((pid, wid))
+    if snap:
+        title = snap["title"]
+
+    if name == "get_window_state":
+        call_args.update({"include_screenshot": False, "max_elements": 600, "timeout_ms": 4000})
+    elif name in _ELEMENT_TOOLS:
+        idx = args.get("element_index")
+        if idx is not None:
+            element = snap["elements"].get(idx) if snap else None
+            if not element:
+                return f"ERROR: no element [{idx}] is known for that window. Call get_window_state first and use an index from its output."
+            call_args.pop("element_index")
+            call_args["element_token"] = element["element_token"]
+        elif name in {"click", "set_value"}:
+            return f"ERROR: {name} needs an element_index from get_window_state."
+
+    driver_name = name
+    if name == "click" and call_args.get("count") == 2:
+        driver_name = "double_click"
+        call_args.pop("count")
+
+    risk = check_ui_action_risk(name, {**args, "intent": intent}, element, title)
+    if risk and not _await_confirmation(state, risk):
+        return "ERROR: the user denied this action. Do not retry it."
+
+    log(f"screen: {driver_name} {json.dumps({k: v for k, v in call_args.items() if k != 'text'})[:200]}"
+        + (f" - {intent[:140]}" if intent else ""))
+    r = bridge.call(driver_name, call_args)
+    if name == "get_window_state" and r["ok"]:
+        _remember_snapshot(state, r["data"])
+    return _fmt_result(r)
+
+
+# ---------------------------------------------------------------------------
+# Agent loop
+# ---------------------------------------------------------------------------
+
+def _reason(reasoner, messages, tools):
+    """One model step with bounded retry on rate limits / overload / malformed calls."""
+    attempt = 0
+    while True:
+        try:
+            return reasoner.step(PERSONA, messages, tools)
+        except ReasonerError as e:
+            attempt += 1
+            daily = "per day" in str(e).lower()  # a daily quota won't clear in a minute
+            retryable = (e.kind in ("rate_limit", "transient") and not daily and attempt <= 3) or \
+                        (e.kind == "bad_tool_call" and attempt <= 2)
+            if not retryable:
+                raise
+            wait = 1 if e.kind == "bad_tool_call" else min(e.retry_after or 15 * attempt, 65)
+            log(f"{reasoner.provider} {e.kind}, retry {attempt} in {wait:.0f}s: {e}")
+            time.sleep(wait)
+
+
+def _run_custom_tool(state, name, args):
+    needs_confirm = name in RISKY_TOOLS or (name == "run_shell_command" and is_extra_risky_shell(args))
+    if needs_confirm and not _await_confirmation(state, describe_risky_call(name, args)):
+        return "The user denied this action. Do not retry it."
+    return str(CUSTOM_FUNCTIONS[name](args))
+
 
 def run_agent_loop(task_id, user_text):
     state = TASKS[task_id]
@@ -506,142 +596,46 @@ def run_agent_loop(task_id, user_text):
     state["log"].append({"role": "user", "text": user_text})
     log(f"task {task_id}: START — \"{user_text}\"")
 
-    if client is None:
-        state["status"] = "error"
-        state["result"] = "GEMINI_API_KEY is not set in agent/.env — see README.md."
-        return
-
-    tools = CUSTOM_TOOL_SCHEMAS + [{"type": "computer_use", "environment": ENVIRONMENT}]
-    screenshot = take_screenshot_bytes()
-
     try:
-        interaction = client.interactions.create(
-            model=MODEL,
-            input=[
-                {"type": "text", "text": f"{PERSONA}\n\nTask from Lazarus: {user_text}"},
-                {"type": "image", "data": base64.b64encode(screenshot).decode("utf-8"), "mime_type": "image/png"},
-            ],
-            tools=tools,
-        )
-    except Exception as e:
-        log(f"task {task_id}: Gemini call failed: {e}")
-        state["status"] = "error"
-        state["result"] = f"Gemini API error: {e}"
+        reasoner = make_reasoner()
+    except ReasonerError as e:
+        state["status"], state["result"] = "error", str(e)
         return
+    log(f"task {task_id}: reasoner {reasoner.provider}/{reasoner.model}")
 
-    for step_num in range(MAX_STEPS):
-        steps = _get(interaction, "steps", "output", default=[]) or []
+    tools = CUSTOM_TOOL_SCHEMAS + CUA_TOOL_SCHEMAS
+    messages = [{"role": "user", "text": user_text}]
 
-        text_parts = []
-        function_calls = []
-        for s in steps:
-            s_type = _get(s, "type")
-            if s_type in ("model_output", "text", "message"):
-                # Confirmed shape (per ai.google.dev/gemini-api/docs/interactions):
-                # {"type": "model_output", "content": [{"type": "text", "text": "..."}]}
-                # Also accept a flat .text as a fallback in case the SDK sugars it.
-                t = _get(s, "text")
-                if t:
-                    text_parts.append(t)
-                else:
-                    for c in (_get(s, "content", default=[]) or []):
-                        if _get(c, "type") == "text":
-                            ct = _get(c, "text")
-                            if ct:
-                                text_parts.append(ct)
-            elif s_type == "function_call":
-                function_calls.append(s)
+    for _ in range(MAX_STEPS):
+        try:
+            out = _reason(reasoner, messages, tools)
+        except ReasonerError as e:
+            log(f"task {task_id}: {reasoner.provider} call failed ({e.kind}): {e}")
+            state["status"], state["result"] = "error", f"{reasoner.provider} error: {e}"
+            return
 
-        if text_parts:
-            state["log"].append({"role": "vesper", "text": " ".join(text_parts)})
-
-        if not function_calls:
+        if out["text"]:
+            state["log"].append({"role": "vesper", "text": out["text"]})
+        if not out["tool_calls"]:
             state["status"] = "done"
-            state["result"] = " ".join(text_parts) if text_parts else "Done."
+            state["result"] = out["text"] or "Done."
             log(f"task {task_id}: DONE — {state['result']}")
             return
+        messages.append({"role": "assistant", "text": out["text"], "tool_calls": out["tool_calls"], "raw": out["raw"]})
 
-        function_responses = []
-        for call in function_calls:
-            name = _get(call, "name")
-            call_id = _get(call, "id", "call_id", default=str(uuid.uuid4()))
-            args = _get(call, "arguments", "args", default={}) or {}
-
-            safety = args.get("safety_decision") if isinstance(args, dict) else None
-            approved_already = False
-            if safety and safety.get("decision") == "require_confirmation":
-                description = f"Gemini flagged this for approval: {safety.get('explanation', name)}"
-                approved_already = _await_confirmation(state, description)
-                if not approved_already:
-                    function_responses.append(_result(name, call_id, "Denied by user.", screenshot=take_screenshot_bytes(), is_error=True))
-                    continue
-
+        for call in out["tool_calls"]:
+            name, args = call["name"], call["args"] or {}
             if name in CUSTOM_FUNCTIONS:
-                needs_confirm = name in RISKY_TOOLS or (name == "run_shell_command" and is_extra_risky_shell(args))
-                if needs_confirm and not approved_already:
-                    description = describe_risky_call(name, args)
-                    if not _await_confirmation(state, description):
-                        function_responses.append(_result(name, call_id, "The user denied this action. Do not retry it.", is_error=True))
-                        continue
-                output = CUSTOM_FUNCTIONS[name](args)
-                function_responses.append(_result(name, call_id, str(output)))
-
-            elif name in COMPUTER_USE_ACTIONS:
-                cu_args = args if isinstance(args, dict) else {}
-                intent_text = cu_args.get("intent") or ""
-                if name == "type" and cu_args.get("text"):
-                    state["last_typed_text"] = cu_args.get("text")
-
-                # Backstop: only runs when Gemini's OWN safety_decision didn't
-                # already gate this action above — this is the second,
-                # independent check, not a replacement for it.
-                if not approved_already and name in RISKY_INTENT_ACTIONS and looks_like_risky_send(intent_text):
-                    description = describe_risky_send(intent_text, state.get("last_typed_text"))
-                    approved_already = _await_confirmation(state, description)
-                    if not approved_already:
-                        function_responses.append(_result(name, call_id, "The user denied this action. Do not retry it.", is_error=True, screenshot=take_screenshot_bytes()))
-                        continue
-
-                execute_computer_action(name, cu_args)
-                shot = take_screenshot_bytes()
-                result_value = {"ok": True}
-                if approved_already:
-                    # Per Google's computer-use docs, the model expects this
-                    # flag back on the result once a human has approved a
-                    # confirmation-gated action, whether Gemini's own
-                    # safety_decision asked for it or our own backstop did.
-                    result_value["safety_acknowledgement"] = True
-                function_responses.append(_result(name, call_id, result_value, screenshot=shot))
-
+                content = _run_custom_tool(state, name, args)
+            elif name in EXPOSED_CUA_TOOLS:
+                content = run_cua_tool(state, name, args)
             else:
-                function_responses.append(_result(name, call_id, f"Unknown tool '{name}'", is_error=True))
-
-        try:
-            interaction = client.interactions.create(
-                model=MODEL,
-                previous_interaction_id=_get(interaction, "id"),
-                input=function_responses,
-                tools=tools,
-            )
-        except Exception as e:
-            log(f"task {task_id}: Gemini follow-up call failed: {e}")
-            state["status"] = "error"
-            state["result"] = f"Gemini API error: {e}"
-            return
+                content = f"ERROR: unknown tool '{name}'."
+            messages.append({"role": "tool", "id": call["id"], "name": name, "content": content})
 
     state["status"] = "done"
     state["result"] = "Stopped after reaching the step limit for a single task — ask again to continue."
     log(f"task {task_id}: STEP LIMIT reached")
-
-
-def _result(name, call_id, result_value, screenshot=None, is_error=False):
-    content = [{"type": "text", "text": json.dumps(result_value) if not isinstance(result_value, str) else result_value}]
-    if screenshot:
-        content.append({"type": "image", "data": base64.b64encode(screenshot).decode("utf-8"), "mime_type": "image/png"})
-    entry = {"type": "function_result", "name": name, "call_id": call_id, "result": content}
-    if is_error:
-        entry["is_error"] = True
-    return entry
 
 
 def _await_confirmation(state, description):
@@ -663,7 +657,44 @@ def _await_confirmation(state, description):
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"ok": True, "model": MODEL, "has_key": bool(GEMINI_API_KEY)})
+    provider = (os.environ.get("VESPER_REASONER") or "gemini").lower()
+    key_var = {"groq": "GROQ_API_KEY", "gemini": "GEMINI_API_KEY"}.get(provider)
+    return jsonify({
+        "ok": True,
+        "reasoner": provider,
+        "has_key": bool(key_var and os.environ.get(key_var)),
+        "cua_mode": CUA_MODE,
+    })
+
+
+QUICK_ACTIONS = {
+    "mute": lambda: toggles.set_mute(True),
+    "unmute": lambda: toggles.set_mute(False),
+    "toggle_mute": lambda: toggles.set_mute(None),
+    "dnd_on": lambda: _with_bridge(lambda b: toggles.set_dnd(b, True)),
+    "dnd_off": lambda: _with_bridge(lambda b: toggles.set_dnd(b, False)),
+    "toggle_dnd": lambda: _with_bridge(lambda b: toggles.set_dnd(b, None)),
+    "lock": toggles.lock_screen,
+}
+
+
+def _with_bridge(fn):
+    bridge, err = get_bridge()
+    if not bridge:
+        return {"ok": False, "message": f"Screen control is unavailable: {err}", "state": None}
+    return fn(bridge)
+
+
+@app.route("/quick", methods=["POST"])
+def quick():
+    """Direct toggles with no model in the loop — see toggles.py."""
+    action = ((request.get_json(force=True) or {}).get("action") or "").strip()
+    fn = QUICK_ACTIONS.get(action)
+    if not fn:
+        return jsonify({"ok": False, "message": f"Unknown quick action '{action}'.", "actions": sorted(QUICK_ACTIONS)}), 400
+    result = fn()
+    log(f"quick action {action}: {result.get('message')}")
+    return jsonify(result)
 
 
 @app.route("/command", methods=["POST"])
@@ -681,7 +712,7 @@ def command():
         "pending": None,
         "approved": False,
         "confirm_event": threading.Event(),
-        "last_typed_text": None,
+        "snapshots": {},
     }
     thread = threading.Thread(target=run_agent_loop, args=(task_id, text), daemon=True)
     thread.start()
@@ -714,8 +745,5 @@ def confirm(task_id):
 
 if __name__ == "__main__":
     print(f"Vesper Agent listening on http://127.0.0.1:{PORT}")
-    print(f"Screen size detected as {SCREEN_WIDTH}x{SCREEN_HEIGHT}")
-    print(f"Model: {MODEL} | Environment: {ENVIRONMENT}")
-    if not GEMINI_API_KEY:
-        print("WARNING: GEMINI_API_KEY is not set — copy agent/.env.example to agent/.env and fill it in.")
-    app.run(host="127.0.0.1", port=PORT, debug=False)
+    print(f"Reasoner: {os.environ.get('VESPER_REASONER') or 'gemini'} | cua-driver mode: {CUA_MODE}")
+    app.run(host="127.0.0.1", port=PORT, debug=False, threaded=True)
