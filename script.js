@@ -170,11 +170,15 @@
     if (muted && window.speechSynthesis) speechSynthesis.cancel();
   });
 
-  // Pick a real, human-quality male voice when one's available, instead of
-  // leaving it to whatever the browser's own default happens to be (which
-  // varies by device and isn't reliably male). Falls back gracefully:
-  // male+high-quality > any male > any high-quality > browser default.
+  // Voice choice. What you can get is decided by the device, not this app:
+  // the browser only exposes the voices the OS/browser ships. The genuinely
+  // human-sounding ones are the neural voices (Edge's "... Online (Natural)",
+  // Apple's "Premium/Enhanced", Android's network voices). Old Windows
+  // "Desktop" voices and most default voices sound robotic. So: rank what's
+  // there (neural first, then male, since that's the preference so far), let
+  // the VOICE button step through the list, and remember the pick.
   // Voice list loads asynchronously in most browsers, hence voiceschanged.
+  const VOICE_KEY = 'vesper.voice';
   let cachedVoices = [];
   function refreshVoices() {
     if ('speechSynthesis' in window) cachedVoices = speechSynthesis.getVoices();
@@ -183,19 +187,66 @@
     refreshVoices();
     speechSynthesis.onvoiceschanged = refreshVoices;
   }
-  const QUALITY_PATTERNS = [/natural/i, /neural/i, /premium/i, /enhanced/i, /online/i];
-  const MALE_PATTERNS = [/\bguy\b/i, /\bdavid\b/i, /\bmark\b/i, /\bryan\b/i, /\bdaniel\b/i, /\balex\b/i, /\bfred\b/i, /\btom\b/i, /\baaron\b/i, /\bnathan\b/i, /\boliver\b/i, /\bjames\b/i, /\bbrian\b/i, /\beric\b/i, /\bmale\b/i];
-  function pickVoice() {
+  const MALE_PATTERNS = [/\bguy\b/i, /\bryan\b/i, /\bdavid\b/i, /\bmark\b/i, /\bgeorge\b/i, /\bdaniel\b/i, /\balex\b/i, /\bfred\b/i, /\btom\b/i, /\baaron\b/i, /\bnathan\b/i, /\boliver\b/i, /\bjames\b/i, /\bbrian\b/i, /\beric\b/i, /\bmale\b/i];
+  function voiceScore(v) {
+    let score = 0;
+    if (/natural|neural/i.test(v.name)) score += 100;      // neural: the human-sounding tier
+    else if (/premium|enhanced|online/i.test(v.name)) score += 60;
+    if (v.localService === false) score += 10;             // network voices are usually better than on-device ones
+    if (/\bdesktop\b/i.test(v.name)) score -= 20;          // old Windows SAPI voices: robotic
+    if (MALE_PATTERNS.some((p) => p.test(v.name))) score += 25;
+    if (/^en-(US|GB|ZA|AU|IE)/i.test(v.lang)) score += 3;
+    return score;
+  }
+  function rankedVoices() {
     if (!cachedVoices.length) refreshVoices();
-    if (!cachedVoices.length) return null;
-    const enVoices = cachedVoices.filter(v => /^en(-|_|$)/i.test(v.lang));
-    const pool = enVoices.length ? enVoices : cachedVoices;
-    const isMale = (v) => MALE_PATTERNS.some((p) => p.test(v.name));
-    const isQuality = (v) => QUALITY_PATTERNS.some((p) => p.test(v.name));
-    return pool.find((v) => isMale(v) && isQuality(v))
-      || pool.find(isMale)
-      || pool.find(isQuality)
-      || pool[0] || null;
+    const en = cachedVoices.filter(v => /^en(-|_|$)/i.test(v.lang));
+    const pool = en.length ? en : cachedVoices;
+    return pool.map((v, i) => ({ v, i, s: voiceScore(v) })).sort((a, b) => b.s - a.s || a.i - b.i).map(x => x.v);
+  }
+  function pickVoice() {
+    const ranked = rankedVoices();
+    if (!ranked.length) return null;
+    let saved = null;
+    try { saved = localStorage.getItem(VOICE_KEY); } catch (e) { /* storage blocked — fall back to ranking */ }
+    return (saved && ranked.find(v => v.name === saved)) || ranked[0];
+  }
+
+  // Strip what sounds wrong when read aloud: markdown marks, code, links, emoji.
+  // The on-screen text is untouched — this only affects what's spoken.
+  function cleanForSpeech(text) {
+    return String(text || '')
+      .replace(/```[\s\S]*?```/g, ' code block. ')
+      .replace(/`([^`]*)`/g, '$1')
+      .replace(/\[([^\]]+)\]\((?:[^)]+)\)/g, '$1')
+      .replace(/https?:\/\/\S+/g, 'link')
+      .replace(/[*_#>~|]+/g, ' ')
+      .replace(/[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{FE0F}]/gu, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  const voiceBtn = document.getElementById('voiceBtn');
+  if (voiceBtn) {
+    if (!('speechSynthesis' in window)) {
+      voiceBtn.disabled = true;
+      voiceBtn.title = "This browser has no speech output.";
+    }
+    voiceBtn.addEventListener('click', () => {
+      const ranked = rankedVoices();
+      if (!ranked.length) {
+        appendMessage('vesper', "Your browser hasn't given me any voices yet — try again in a second.");
+        return;
+      }
+      const cur = pickVoice();
+      const next = ranked[(ranked.indexOf(cur) + 1) % ranked.length];
+      try { localStorage.setItem(VOICE_KEY, next.name); } catch (e) { /* not fatal */ }
+      const neural = /natural|neural/i.test(next.name);
+      voiceBtn.title = `Voice: ${next.name}. Tap to try the next one (${ranked.length} available).`;
+      const line = `This is ${next.name.replace(/^(Microsoft|Google)\s+/i, '').replace(/\s*\(.*\)/, '')}. How do I sound?`;
+      appendMessage('vesper', `Voice: ${next.name}${neural ? '' : ' (not a neural voice — it will sound more synthetic than a Natural one)'}. Tap VOICE again to try the next of ${ranked.length}.`);
+      speak(line);
+    });
   }
 
   // speakChunk queues one utterance without cancelling what's already
@@ -207,10 +258,12 @@
     if (muted || !('speechSynthesis' in window) || !text || !text.trim()) return;
     rememberSpoken(text);
     try {
-      const u = new SpeechSynthesisUtterance(text);
+      const spoken = cleanForSpeech(text);
+      if (!spoken) return;
+      const u = new SpeechSynthesisUtterance(spoken);
       const voice = pickVoice();
       if (voice) u.voice = voice;
-      u.rate = 1.03; u.pitch = 1.0; // natural pitch — let a real human-recorded voice sound like itself instead of distorting it
+      u.rate = 0.97; u.pitch = 1.0; // slightly under 1.0 for clarity; natural pitch so a good voice isn't distorted
       u.onstart = () => setState('speaking');
       u.onend = () => { if (!speechSynthesis.speaking) setState('idle'); };
       u.onerror = () => setState('idle');
